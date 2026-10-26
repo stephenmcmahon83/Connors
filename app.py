@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 # ==========================================
 st.set_page_config(
     page_title="ConnorsRSI Pullback Scanner & Backtester",
-    page_layout="wide",
+    layout="wide",
     initial_sidebar_state="expanded"
 )
 
