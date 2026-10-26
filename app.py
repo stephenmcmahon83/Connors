@@ -470,4 +470,186 @@ with tab_screen:
                             "Last Close": round(curr_close, 2),
                             "X-Day High": round(x_high_val, 2) if pd.notna(x_high_val) else np.nan,
                             "Unrealized PnL %": round(gain_pct, 2) if in_trade else np.nan,
-                            "Days Held": days_held
+                            "Days Held": days_held if in_trade else 0
+                        })
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            progress_bar.progress((b + 1) / num_batches)
+            
+        progress_bar.empty()
+        status_box.empty()
+        
+        if results:
+            res_df = pd.DataFrame(results)
+            
+            # Sort: actionable statuses first, then lowest 2-Day CRSI
+            status_order = {"🚨 EXIT TOMORROW": 0, "🟢 BUY SIGNAL": 1, "🟡 OPEN / HOLDING": 2, "⚪ NEUTRAL": 3}
+            res_df['order'] = res_df['Status'].map(status_order).fillna(4)
+            res_df = res_df.sort_values(by=['order', '2-Day CRSI'], ascending=[True, True]).drop(columns=['order'])
+            
+            if filter_actionable:
+                res_df = res_df[res_df['Status'] != "⚪ NEUTRAL"]
+                
+            n_buys = len(res_df[res_df['Status'] == "🟢 BUY SIGNAL"])
+            n_exits = len(res_df[res_df['Status'] == "🚨 EXIT TOMORROW"])
+            n_open = len(res_df[res_df['Status'] == "🟡 OPEN / HOLDING"])
+            
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            col_m1.metric("Scanned", len(results))
+            col_m2.metric("Buy Signals Today", n_buys)
+            col_m3.metric("Exits for Tomorrow", n_exits)
+            col_m4.metric("Holding Positions", n_open)
+            
+            st.dataframe(
+                res_df.style.format({
+                    "2-Day CRSI": "{:.2f}",
+                    "1-Day CRSI": "{:.2f}",
+                    "Last Close": "${:.2f}",
+                    "X-Day High": "${:.2f}",
+                    "Unrealized PnL %": "{:+.2f}%"
+                }, na_rep="-"),
+                use_container_width=True,
+                height=550
+            )
+        else:
+            st.warning("No data retrieved for the selected parameters.")
+
+# ------------------------------------------
+# TAB 2: ALL BUCKETS MATRIX
+# ------------------------------------------
+with tab_matrix:
+    bt_ticker = st.text_input("Matrix Benchmark Ticker", value="SPY", key="matrix_ticker").upper()
+    start_bt = st.date_input("Start Date", value=datetime.today() - timedelta(days=10*365), key="matrix_date")
+    
+    if st.button("Run Larry Connors Bucket Study", type="primary"):
+        with st.spinner(f"Computing 10-Bucket Matrix on {bt_ticker}..."):
+            raw_bt = yf.download(bt_ticker, start=start_bt, interval="1d", progress=False, auto_adjust=True)
+            if isinstance(raw_bt.columns, pd.MultiIndex):
+                raw_bt.columns = raw_bt.columns.get_level_values(0)
+                
+            if len(raw_bt) >= 120:
+                p_df = prepare_crsi_data(raw_bt, x_days=x_days)
+                matrix_rows = []
+                
+                for b_name, (lb, hb) in BUCKET_RANGES.items():
+                    tdf, eqdf = backtest_bucket(
+                        df=p_df, low_b=lb, high_b=hb, exit_mode=exit_mode,
+                        crsi_exit_thresh=crsi_exit_thresh, entry_timing=entry_timing
+                    )
+                    n_trades = len(tdf)
+                    if n_trades > 0:
+                        wins = tdf[tdf['PnL ($)'] > 0]
+                        wr = (len(wins) / n_trades) * 100.0
+                        avg_ret = tdf['Return %'].mean()
+                        tot_pnl = tdf['PnL ($)'].sum()
+                        avg_days = tdf['Hold Days'].mean()
+                        gross_p = tdf.loc[tdf['PnL ($)'] > 0, 'PnL ($)'].sum()
+                        gross_l = abs(tdf.loc[tdf['PnL ($)'] < 0, 'PnL ($)'].sum())
+                        pf = (gross_p / gross_l) if gross_l > 0 else np.inf
+                        roll_max = eqdf['Equity'].cummax()
+                        dd = (eqdf['Equity'] - roll_max) / roll_max
+                        mdd = dd.min() * 100.0
+                    else:
+                        wr = avg_ret = tot_pnl = pf = mdd = avg_days = 0.0
+
+                    matrix_rows.append({
+                        "2-Day CRSI Bucket": b_name,
+                        "Total Trades": n_trades,
+                        "Win Rate %": round(wr, 1),
+                        "Avg Return %": round(avg_ret, 2),
+                        "Profit Factor": round(pf, 2) if pf != np.inf else "∞",
+                        "Total PnL ($)": round(tot_pnl, 2),
+                        "Max Drawdown %": round(mdd, 1),
+                        "Avg Hold (Days)": round(avg_days, 1)
+                    })
+                    
+                sum_df = pd.DataFrame(matrix_rows)
+                st.dataframe(
+                    sum_df.style.format({
+                        "Win Rate %": "{:.1f}%",
+                        "Avg Return %": "{:.2f}%",
+                        "Total PnL ($)": "${:,.2f}",
+                        "Max Drawdown %": "{:.1f}%",
+                        "Avg Hold (Days)": "{:.1f}"
+                    }),
+                    use_container_width=True
+                )
+                
+                fig_bar = go.Figure()
+                fig_bar.add_trace(go.Bar(
+                    x=sum_df["2-Day CRSI Bucket"], y=sum_df["Win Rate %"],
+                    name="Win Rate %", marker_color="#2962FF"
+                ))
+                fig_bar.add_trace(go.Bar(
+                    x=sum_df["2-Day CRSI Bucket"], y=sum_df["Avg Return %"],
+                    name="Avg Return %", yaxis="y2", marker_color="#00C805"
+                ))
+                fig_bar.update_layout(
+                    title="Win Rate & Average Trade Return across 2-Day CRSI Buckets",
+                    xaxis_title="2-Day CRSI Band",
+                    yaxis=dict(title="Win Rate (%)", side="left", range=[0, 100]),
+                    yaxis2=dict(title="Avg Return (%)", side="right", overlaying="y"),
+                    template="plotly_white", barmode="group", height=450
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+            else:
+                st.error("Insufficient historical data for backtesting.")
+
+# ------------------------------------------
+# TAB 3: SINGLE BUCKET DEEP DIVE
+# ------------------------------------------
+with tab_deep:
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        deep_ticker = st.text_input("Ticker Symbol", value="SPY", key="deep_ticker").upper()
+    with c2:
+        deep_start = st.date_input("Start Date", value=datetime.today() - timedelta(days=10*365), key="deep_date")
+    with c3:
+        deep_bucket = st.selectbox("Inspect Bucket", list(BUCKET_RANGES.keys()), index=0, key="deep_bucket")
+        
+    if st.button("Run Single Bucket Backtest", type="primary"):
+        with st.spinner("Calculating performance..."):
+            raw_single = yf.download(deep_ticker, start=deep_start, interval="1d", progress=False, auto_adjust=True)
+            if isinstance(raw_single.columns, pd.MultiIndex):
+                raw_single.columns = raw_single.columns.get_level_values(0)
+                
+            if len(raw_single) >= 120:
+                p_df_single = prepare_crsi_data(raw_single, x_days=x_days)
+                b_min, b_max = BUCKET_RANGES[deep_bucket]
+                tdf_s, eqdf_s = backtest_bucket(
+                    p_df_single, low_b=b_min, high_b=b_max, exit_mode=exit_mode,
+                    crsi_exit_thresh=crsi_exit_thresh, entry_timing=entry_timing
+                )
+                
+                if tdf_s.empty:
+                    st.warning("No trades triggered for this bucket.")
+                else:
+                    wr = (len(tdf_s[tdf_s['PnL ($)'] > 0]) / len(tdf_s)) * 100.0
+                    tot_ret = ((eqdf_s['Equity'].iloc[-1] / 10000.0) - 1) * 100.0
+                    gp = tdf_s.loc[tdf_s['PnL ($)'] > 0, 'PnL ($)'].sum()
+                    gl = abs(tdf_s.loc[tdf_s['PnL ($)'] < 0, 'PnL ($)'].sum())
+                    pf = (gp / gl) if gl > 0 else np.nan
+                    
+                    roll_max = eqdf_s['Equity'].cummax()
+                    mdd = ((eqdf_s['Equity'] - roll_max) / roll_max).min() * 100.0
+                    
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Total Trades", len(tdf_s))
+                    m2.metric("Win Rate", f"{wr:.1f}%")
+                    m3.metric("Profit Factor", f"{pf:.2f}" if not np.isnan(pf) else "N/A")
+                    m4.metric("Max Drawdown", f"{mdd:.1f}%")
+                    
+                    fig_eq = go.Figure()
+                    fig_eq.add_trace(go.Scatter(
+                        x=eqdf_s.index, y=eqdf_s['Equity'],
+                        mode='lines', line=dict(color='#00C805', width=2)
+                    ))
+                    fig_eq.update_layout(
+                        title=f"{deep_ticker} Equity Curve — Bucket [{deep_bucket}]",
+                        xaxis_title="Date", yaxis_title="Equity ($)",
+                        template="plotly_white", height=420
+                    )
+                    st.plotly_chart(fig_eq, use_container_width=True)
+                    st.dataframe(tdf_s, use_container_width=True)
