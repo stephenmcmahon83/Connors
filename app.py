@@ -4,10 +4,8 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import urllib.request
 
-# ==========================================
-# PAGE CONFIGURATION
-# ==========================================
 st.set_page_config(
     page_title="ConnorsRSI Pullback Scanner & Backtester",
     layout="wide",
@@ -15,10 +13,11 @@ st.set_page_config(
 )
 
 # ==========================================
-# TECHNICAL INDICATORS CALCULATION
+# 1. TECHNICAL INDICATORS (PURE VECTORIZED)
 # ==========================================
-def compute_rsi(series: pd.Series, period: int) -> pd.Series:
-    """Standard Wilder's RSI."""
+
+def calculate_rsi(series: pd.Series, period: int) -> pd.Series:
+    """Wilder's RSI."""
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -26,333 +25,440 @@ def compute_rsi(series: pd.Series, period: int) -> pd.Series:
     avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     
-    rs = avg_gain / (avg_loss + 1e-10)
-    return 100 - (100 / (1 + rs))
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
 
-def compute_streak(series: pd.Series) -> pd.Series:
-    """Calculates consecutive days of up/down closes."""
-    streak = np.zeros(len(series))
-    close_vals = series.values
-    for i in range(1, len(close_vals)):
-        if close_vals[i] > close_vals[i-1]:
-            streak[i] = streak[i-1] + 1 if streak[i-1] > 0 else 1
-        elif close_vals[i] < close_vals[i-1]:
-            streak[i] = streak[i-1] - 1 if streak[i-1] < 0 else -1
+def calculate_streak(close: pd.Series) -> pd.Series:
+    """Consecutive up/down close days counter."""
+    diff = close.diff()
+    streak = np.zeros(len(close))
+    for i in range(1, len(close)):
+        if diff.iloc[i] > 0:
+            streak[i] = streak[i - 1] + 1 if streak[i - 1] > 0 else 1
+        elif diff.iloc[i] < 0:
+            streak[i] = streak[i - 1] - 1 if streak[i - 1] < 0 else -1
         else:
             streak[i] = 0
-    return pd.Series(streak, index=series.index)
+    return pd.Series(streak, index=close.index)
 
-def compute_percent_rank(series: pd.Series, lookback: int = 100) -> pd.Series:
-    """Percentage of prior 1-day returns in the lookback lower than today's return."""
+def calculate_percent_rank(series: pd.Series, period: int = 100) -> pd.Series:
+    """Rolling 1-day return percentile rank over N periods (0 to 100)."""
     pct_change = series.pct_change()
     
     def rolling_rank(window):
-        current_return = window[-1]
-        prior_returns = window[:-1]
-        return (prior_returns < current_return).mean() * 100.0
-    
-    return pct_change.rolling(lookback + 1).apply(rolling_rank, raw=True)
+        current = window[-1]
+        return (np.sum(window[:-1] < current) / (len(window) - 1)) * 100 if len(window) > 1 else 50.0
 
-def compute_connors_rsi(df: pd.DataFrame, rsi_len: int = 3, streak_len: int = 2, rank_len: int = 100) -> pd.Series:
-    """ConnorsRSI = (RSI(Close, 3) + RSI(Streak, 2) + PercentRank(Return, 100)) / 3."""
-    price_rsi = compute_rsi(df['Close'], rsi_len)
-    streak_series = compute_streak(df['Close'])
-    streak_rsi = compute_rsi(streak_series, streak_len)
-    prank = compute_percent_rank(df['Close'], rank_len)
-    
-    return (price_rsi + streak_rsi + prank) / 3.0
+    return pct_change.rolling(period + 1).apply(rolling_rank, raw=True).fillna(50)
 
-def compute_adx(df: pd.DataFrame, period: int = 10) -> pd.Series:
-    """10-day Average Directional Index (ADX) using Wilder smoothing."""
-    high = df['High']
-    low = df['Low']
-    close = df['Close']
+def calculate_connors_rsi(close: pd.Series, rsi_len: int = 3, streak_len: int = 2, rank_len: int = 100) -> pd.Series:
+    """ConnorsRSI(3, 2, 100)."""
+    rsi_price = calculate_rsi(close, rsi_len)
+    streak = calculate_streak(close)
+    rsi_streak = calculate_rsi(streak, streak_len)
+    pct_rank = calculate_percent_rank(close, rank_len)
+    return (rsi_price + rsi_streak + pct_rank) / 3.0
+
+def calculate_adx(df: pd.DataFrame, period: int = 10) -> pd.Series:
+    """10-day Average Directional Index (ADX) using Wilder's smoothing."""
+    high, low, close = df['High'], df['Low'], df['Close']
+    prev_close = close.shift(1)
     
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
     
     up_move = high - high.shift(1)
     down_move = low.shift(1) - low
     
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    pos_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+    neg_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
     
     tr_smooth = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    plus_dm_smooth = pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    minus_dm_smooth = pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    pos_dm_smooth = pos_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    neg_dm_smooth = neg_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     
-    plus_di = 100 * (plus_dm_smooth / (tr_smooth + 1e-10))
-    minus_di = 100 * (minus_dm_smooth / (tr_smooth + 1e-10))
+    pos_di = 100 * (pos_dm_smooth / tr_smooth.replace(0, np.nan))
+    neg_di = 100 * (neg_dm_smooth / tr_smooth.replace(0, np.nan))
     
-    dx = 100 * (plus_di - minus_di).abs() / ((plus_di + minus_di) + 1e-10)
+    dx = 100 * ((pos_di - neg_di).abs() / (pos_di + neg_di).replace(0, np.nan))
     adx = dx.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    return adx
+    return adx.fillna(0)
 
-def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Appends all required filters and indicator columns to the dataset."""
+def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Pre-computes indicators and setup conditions."""
     df = df.copy()
-    df['Vol_SMA21'] = df['Volume'].rolling(21).mean()
-    df['ADX10'] = compute_adx(df, period=10)
-    df['ConnorsRSI'] = compute_connors_rsi(df, 3, 2, 100)
+    df['SMA21_Vol'] = df['Volume'].rolling(21).mean()
+    df['ADX10'] = calculate_adx(df, 10)
+    df['CRSI'] = calculate_connors_rsi(df['Close'], 3, 2, 100)
     
-    # Intraday low dip from yesterday's close
-    df['Prev_Close'] = df['Close'].shift(1)
-    df['Low_Drop_Pct'] = (1 - (df['Low'] / df['Prev_Close'])) * 100.0
-    
-    # Position of close relative to the day's total range (0 = at low, 100 = at high)
-    day_range = df['High'] - df['Low']
-    df['Close_Range_Pct'] = np.where(day_range > 0, ((df['Close'] - df['Low']) / day_range) * 100.0, 50.0)
-    
+    day_range = (df['High'] - df['Low']).replace(0, np.nan)
+    df['Close_Range_Pct'] = ((df['Close'] - df['Low']) / day_range) * 100.0
+    df['Intraday_Drop_Pct'] = ((df['Close'].shift(1) - df['Low']) / df['Close'].shift(1)) * 100.0
     return df
 
 # ==========================================
-# SIDEBAR PARAMETERS
+# 2. TICKER UNIVERSE RETRIEVAL
 # ==========================================
-st.sidebar.title("Strategy Parameters")
 
-W = st.sidebar.selectbox("W: Intraday Low Drop Below Prior Close (%)", [2, 4, 6, 8], index=1)
-X = st.sidebar.selectbox("X: Max Close Location in Day's Range (%)", [10, 25], index=1)
-Y = st.sidebar.slider("Y: ConnorsRSI Entry Cutoff (< Y)", min_value=5, max_value=15, value=10, step=1)
-Z = st.sidebar.selectbox("Z: Next-Day Intraday Limit Discount (%)", [4, 6, 8, 10], index=0)
-N = st.sidebar.selectbox("N: ConnorsRSI Exit Threshold (> N)", [50, 60, 70, 80], index=2)
+MAJOR_ETFS = [
+    "SPY", "QQQ", "IWM", "DIA", "SMH", "SOXX", "XLF", "XLE", "XLK", "XLV", "XLI", 
+    "XLP", "XLU", "XLY", "XLC", "XLB", "XBI", "ARKK", "GLD", "SLV", "TLT", "HYG", 
+    "EEM", "EFA", "FXI", "KWEB", "VNQ", "TQQQ", "SQQQ", "SOXL", "SPXL", "UVXY"
+]
 
-st.sidebar.markdown("---")
-min_price = st.sidebar.number_input("Minimum Stock Price ($)", value=5.0, step=1.0)
-min_volume = st.sidebar.number_input("Minimum 21-Day Avg Volume", value=250000, step=50000)
+TOP_ADRS = [
+    "TSM", "BABA", "ASML", "NVO", "AZN", "SAP", "TM", "HDB", "SE", "PDD", "MELI", 
+    "NIO", "BIDU", "JD", "INFY", "BNS", "BP", "SHEL", "RIO", "VALE", "SNY", "GSK", 
+    "SAN", "DEO", "UL", "ABB", "RELX", "ARGX", "SONY", "MUFG"
+]
+
+RUSSELL_LEADERS = [
+    "PLTR", "HOOD", "AFRM", "SOFI", "RBLX", "COIN", "DKNG", "SNAP", "DASH", "PINS",
+    "CRWD", "NET", "SNOW", "PANW", "ZS", "MDB", "DDOG", "TTD", "ENPH", "CELH",
+    "SYM", "PATH", "IONQ", "SMCI", "ARM", "RIVN", "LCID", "MARA", "RIOT", "CLSK"
+]
+
+@st.cache_data(ttl=86400)
+def get_sp500_tickers() -> list:
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            tables = pd.read_html(response)
+        tickers = tables[0]['Symbol'].str.replace('.', '-', regex=False).tolist()
+        return sorted(list(set(tickers)))
+    except Exception:
+        return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "BRK-B", "JPM", "V", "UNH"]
+
+@st.cache_data(ttl=86400)
+def get_nasdaq100_tickers() -> list:
+    try:
+        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            tables = pd.read_html(response)
+        tickers = tables[4]['Ticker'].str.replace('.', '-', regex=False).tolist()
+        return sorted(list(set(tickers)))
+    except Exception:
+        return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "COST", "AVGO", "TSLA", "AMD"]
 
 # ==========================================
-# BACKTEST ENGINE
+# 3. BACKTESTER ENGINE
 # ==========================================
-def run_backtest(df: pd.DataFrame, W: float, X: float, Y: float, Z: float, N: float, min_price: float, min_volume: float):
+
+def run_backtest(df: pd.DataFrame, W: float, X: float, Y: float, Z: float, N: float, initial_capital: float = 10000.0):
+    df = prepare_data(df)
+    
+    cond1 = df['Close'] > 5.0
+    cond2 = df['SMA21_Vol'] >= 250000
+    cond3 = df['ADX10'] > 30.0
+    cond4 = df['Intraday_Drop_Pct'] >= W
+    cond5 = df['Close_Range_Pct'] <= X
+    cond6 = df['CRSI'] < Y
+    
+    df['Setup_Signal'] = cond1 & cond2 & cond3 & cond4 & cond5 & cond6
+    
     trades = []
-    in_position = False
-    pending_order = None
-    position = {}
-
-    # Iterate bar by bar
-    for i in range(120, len(df)):
-        row = df.iloc[i]
-        date = df.index[i]
-
-        # 1. Check if we hold a position -> Check Exit Rule
-        if in_position:
-            # Exit rule: Close position when ConnorsRSI > N at closing price
-            if row['ConnorsRSI'] > N:
-                exit_price = row['Close']
-                pnl = (exit_price - position['entry_price']) / position['entry_price']
-                trades.append({
-                    'Entry Date': position['entry_date'].strftime('%Y-%m-%d'),
-                    'Entry Price': position['entry_price'],
-                    'Exit Date': date.strftime('%Y-%m-%d'),
-                    'Exit Price': exit_price,
-                    'Return (%)': round(pnl * 100, 2),
-                    'Holding Days': (date - position['entry_date']).days
-                })
-                in_position = False
-                position = {}
-            continue
-
-        # 2. Check if a limit order from yesterday gets filled today
-        if pending_order is not None:
-            limit_price = pending_order['limit_price']
-            # Order triggers if today's low hits or breaches the limit price
-            if row['Low'] <= limit_price:
-                # If market opens below the limit, execution occurs at the better open price
-                fill_price = row['Open'] if row['Open'] < limit_price else limit_price
-                in_position = True
-                position = {
-                    'entry_date': date,
-                    'entry_price': fill_price
-                }
-                pending_order = None
+    in_trade = False
+    entry_price = 0.0
+    entry_date = None
+    shares = 0
+    capital = initial_capital
+    portfolio_values = []
+    
+    dates = df.index
+    for i in range(1, len(df)):
+        curr_date = dates[i]
+        
+        # Rule 8: Exit at close when CRSI > N
+        if in_trade:
+            if df['CRSI'].iloc[i] > N:
+                exit_price = df['Close'].iloc[i]
+                pnl = (exit_price - entry_price) * shares
+                ret_pct = ((exit_price / entry_price) - 1) * 100
+                capital += (shares * exit_price)
                 
-                # Check if exit condition triggers on entry day close
-                if row['ConnorsRSI'] > N:
-                    pnl = (row['Close'] - fill_price) / fill_price
-                    trades.append({
-                        'Entry Date': date.strftime('%Y-%m-%d'),
-                        'Entry Price': fill_price,
-                        'Exit Date': date.strftime('%Y-%m-%d'),
-                        'Exit Price': row['Close'],
-                        'Return (%)': round(pnl * 100, 2),
-                        'Holding Days': 0
-                    })
-                    in_position = False
-                    position = {}
-                continue
-            else:
-                # 1-day limit order expires unfilled
-                pending_order = None
-
-        # 3. Check Setup Rules on Today's Bar
-        cond1 = row['Close'] > min_price
-        cond2 = row['Vol_SMA21'] >= min_volume
-        cond3 = row['ADX10'] > 30.0
-        cond4 = row['Low_Drop_Pct'] >= W
-        cond5 = row['Close_Range_Pct'] <= X
-        cond6 = row['ConnorsRSI'] < Y
-
-        if cond1 and cond2 and cond3 and cond4 and cond5 and cond6:
-            pending_order = {
-                'limit_price': round(row['Close'] * (1 - Z / 100.0), 2),
-                'signal_date': date
-            }
-
-    return pd.DataFrame(trades)
+                trades.append({
+                    'Entry Date': entry_date,
+                    'Entry Price': round(entry_price, 2),
+                    'Exit Date': curr_date,
+                    'Exit Price': round(exit_price, 2),
+                    'Hold Days': (curr_date - entry_date).days,
+                    'Return %': round(ret_pct, 2),
+                    'PnL ($)': round(pnl, 2),
+                    'Equity': round(capital, 2)
+                })
+                in_trade = False
+                shares = 0
+        
+        # Rule 7: Entry limit order Z% below yesterday's close
+        if not in_trade and df['Setup_Signal'].iloc[i - 1]:
+            limit_price = df['Close'].iloc[i - 1] * (1 - (Z / 100.0))
+            if df['Low'].iloc[i] <= limit_price:
+                entry_price = min(df['Open'].iloc[i], limit_price)
+                entry_date = curr_date
+                shares = int(capital // entry_price)
+                if shares > 0:
+                    capital -= (shares * entry_price)
+                    in_trade = True
+        
+        current_equity = capital + (shares * df['Close'].iloc[i] if in_trade else 0)
+        portfolio_values.append({'Date': curr_date, 'Equity': current_equity})
+        
+    equity_df = pd.DataFrame(portfolio_values).set_index('Date') if portfolio_values else pd.DataFrame()
+    trades_df = pd.DataFrame(trades)
+    return trades_df, equity_df
 
 # ==========================================
-# APP TABS: SCANNER & BACKTESTER
+# 4. SIDEBAR CONFIGURATION (UPDATED RANGES)
 # ==========================================
-tab_scanner, tab_backtest, tab_rules = st.tabs(["Candidate Scanner (For Tomorrow)", "Strategy Backtester", "Strategy Rules"])
+
+st.sidebar.header("Strategy Rules Parameters")
+
+# W: 0 to 10, < 10
+W = st.sidebar.slider(
+    "Rule 4: Low % Drop Below Prev Close (W)",
+    min_value=0.0,
+    max_value=9.9,
+    value=4.0,
+    step=0.1,
+    help="Today's low must drop at least W% below yesterday's close (< 10%)."
+)
+
+# X: 0 to 100, step 5
+X = st.sidebar.slider(
+    "Rule 5: Max % of Day's Range for Close (X)",
+    min_value=0,
+    max_value=100,
+    value=25,
+    step=5,
+    help="Today's close must sit in the bottom X% of the day's total range."
+)
+
+# Y: 5 to 95, step 5
+Y = st.sidebar.slider(
+    "Rule 6: ConnorsRSI Entry Threshold (< Y)",
+    min_value=5,
+    max_value=95,
+    value=10,
+    step=5,
+    help="ConnorsRSI(3,2,100) must close below Y."
+)
+
+# Z: 0 to 10
+Z = st.sidebar.slider(
+    "Rule 7: Tomorrow's Limit % Below Close (Z)",
+    min_value=0.0,
+    max_value=10.0,
+    value=4.0,
+    step=0.5,
+    help="Intraday limit order placed Z% below today's closing price."
+)
+
+# N: 0 to 90, step 10
+N = st.sidebar.slider(
+    "Rule 8: ConnorsRSI Exit Threshold (> N)",
+    min_value=0,
+    max_value=90,
+    value=70,
+    step=10,
+    help="Exit position at market close when ConnorsRSI crosses above N."
+)
+
+# ==========================================
+# 5. TABS: SCANNER & BACKTESTER
+# ==========================================
+
+tab1, tab2 = st.tabs(["🔍 Market Scanner (Tomorrow's Setups)", "📊 Strategy Backtester"])
 
 # ------------------------------------------
 # TAB 1: SCANNER
 # ------------------------------------------
-with tab_scanner:
-    st.subheader("Daily Pullback Candidate Scanner")
-    st.write("Scans for stocks satisfying all setup criteria on today's close and computes tomorrow's intraday limit buy price.")
+with tab1:
+    st.subheader("ConnorsRSI Pullback Scanner")
+    st.markdown("Scans selected indices and universes for stocks meeting Rules 1–6 on the latest market close.")
     
-    default_tickers = "AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA, AMD, QQQ, SPY, IWM, NFLX, COIN, PLTR, INTC"
-    ticker_input = st.text_area("Enter Ticker Symbols (comma-separated):", value=default_tickers)
-    scan_button = st.button("Run Scanner", type="primary")
+    selected_universes = st.multiselect(
+        "Select Universes to Include in Scan:",
+        ["S&P 500", "Nasdaq 100", "Russell Leaders / Growth", "Major US ETFs", "Top Global ADRs"],
+        default=["S&P 500", "Nasdaq 100", "Major US ETFs"]
+    )
+    
+    custom_tickers = st.text_input("Add Extra Custom Tickers (Comma-separated, optional):", value="")
+    
+    col_scan, col_cap = st.columns([1, 2])
+    with col_scan:
+        start_scan = st.button("🚀 Run Market Scan", type="primary")
+    with col_cap:
+        scan_limit = st.slider("Max Tickers to Scan (prevents API rate limits)", min_value=50, max_value=800, value=300, step=50)
 
-    if scan_button:
-        tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
+    if start_scan:
+        universe_list = []
+        if "S&P 500" in selected_universes:
+            universe_list.extend(get_sp500_tickers())
+        if "Nasdaq 100" in selected_universes:
+            universe_list.extend(get_nasdaq100_tickers())
+        if "Russell Leaders / Growth" in selected_universes:
+            universe_list.extend(RUSSELL_LEADERS)
+        if "Major US ETFs" in selected_universes:
+            universe_list.extend(MAJOR_ETFS)
+        if "Top Global ADRs" in selected_universes:
+            universe_list.extend(TOP_ADRS)
+            
+        if custom_tickers.strip():
+            universe_list.extend([t.strip().upper() for t in custom_tickers.split(",") if t.strip()])
+            
+        # Deduplicate and apply limit
+        all_tickers = sorted(list(set(universe_list)))[:scan_limit]
+        
+        st.info(f"Scanning {len(all_tickers)} tickers in fast parallel batches...")
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+        
         candidates = []
-        scan_progress = st.progress(0)
-
-        for idx, ticker in enumerate(tickers):
+        batch_size = 50
+        num_batches = int(np.ceil(len(all_tickers) / batch_size))
+        
+        for b in range(num_batches):
+            batch = all_tickers[b * batch_size : (b + 1) * batch_size]
+            status_text.text(f"Fetching batch {b + 1}/{num_batches} ({len(batch)} tickers)...")
+            
             try:
-                stock_df = yf.download(ticker, period="1y", interval="1d", progress=False)
-                if isinstance(stock_df.columns, pd.MultiIndex):
-                    stock_df.columns = stock_df.columns.get_level_values(0)
-
-                if len(stock_df) >= 120:
-                    stock_df = prepare_indicators(stock_df)
-                    latest = stock_df.iloc[-1]
-                    
-                    # Strategy Conditions
-                    c1 = latest['Close'] > min_price
-                    c2 = latest['Vol_SMA21'] >= min_volume
-                    c3 = latest['ADX10'] > 30.0
-                    c4 = latest['Low_Drop_Pct'] >= W
-                    c5 = latest['Close_Range_Pct'] <= X
-                    c6 = latest['ConnorsRSI'] < Y
-
-                    if c1 and c2 and c3 and c4 and c5 and c6:
-                        limit_target = round(latest['Close'] * (1 - Z / 100.0), 2)
-                        candidates.append({
-                            "Ticker": ticker,
-                            "Today Close ($)": round(latest['Close'], 2),
-                            f"Tomorrow Limit ({Z}% off)": limit_target,
-                            "ConnorsRSI": round(latest['ConnorsRSI'], 2),
-                            "ADX(10)": round(latest['ADX10'], 2),
-                            "Low Drop vs Prev Close (%)": round(latest['Low_Drop_Pct'], 2),
-                            "Close Range Loc (%)": round(latest['Close_Range_Pct'], 2),
-                            "21D Avg Vol": f"{int(latest['Vol_SMA21']):,}"
-                        })
-            except Exception as e:
-                st.warning(f"Error fetching data for {ticker}: {e}")
-
-            scan_progress.progress((idx + 1) / len(tickers))
-
+                # Batched download for maximum performance
+                batch_data = yf.download(
+                    tickers=batch,
+                    period="1y",
+                    interval="1d",
+                    group_by="ticker",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=True
+                )
+                
+                for ticker in batch:
+                    try:
+                        # Extract ticker data from single or multi-index structure
+                        if isinstance(batch_data.columns, pd.MultiIndex):
+                            if ticker in batch_data.columns.get_level_values(0):
+                                df_t = batch_data[ticker].dropna(how='all')
+                            elif ticker in batch_data.columns.get_level_values(1):
+                                df_t = batch_data.xs(ticker, axis=1, level=1).dropna(how='all')
+                            else:
+                                continue
+                        else:
+                            df_t = batch_data.dropna(how='all')
+                            
+                        if len(df_t) >= 120:
+                            df_calc = prepare_data(df_t)
+                            latest = df_calc.iloc[-1]
+                            
+                            # Rule 1 to 6 Validation
+                            r1 = latest['Close'] > 5.0
+                            r2 = latest['SMA21_Vol'] >= 250000
+                            r3 = latest['ADX10'] > 30.0
+                            r4 = latest['Intraday_Drop_Pct'] >= W
+                            r5 = latest['Close_Range_Pct'] <= X
+                            r6 = latest['CRSI'] < Y
+                            
+                            if r1 and r2 and r3 and r4 and r5 and r6:
+                                limit_buy = latest['Close'] * (1 - (Z / 100.0))
+                                candidates.append({
+                                    "Ticker": ticker,
+                                    "Close Price": f"${latest['Close']:.2f}",
+                                    "Tomorrow Limit Buy": f"${limit_buy:.2f}",
+                                    "ConnorsRSI": f"{latest['CRSI']:.2f}",
+                                    "ADX(10)": f"{latest['ADX10']:.2f}",
+                                    "Range %": f"{latest['Close_Range_Pct']:.1f}%",
+                                    "Drop from Prev Close %": f"{latest['Intraday_Drop_Pct']:.1f}%",
+                                    "21-Day Avg Vol": f"{int(latest['SMA21_Vol']):,}"
+                                })
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            
+            progress_bar.progress((b + 1) / num_batches)
+            
+        progress_bar.empty()
+        status_text.empty()
+        
         if candidates:
-            res_df = pd.DataFrame(candidates)
-            st.success(f"Found {len(candidates)} trigger setups meeting all criteria!")
-            st.dataframe(res_df, use_container_width=True)
+            st.success(f"Found {len(candidates)} candidate(s) triggering entry orders for tomorrow!")
+            st.dataframe(pd.DataFrame(candidates), use_container_width=True)
         else:
-            st.info("No candidates triggered the strategy on the most recent completed trading session.")
+            st.warning("No tickers met all 6 entry criteria under the current parameter thresholds.")
 
 # ------------------------------------------
 # TAB 2: BACKTESTER
 # ------------------------------------------
-with tab_backtest:
-    st.subheader("Historical Backtester")
-    col_sym, col_start, col_end = st.columns([1, 1, 1])
-    with col_sym:
-        bt_ticker = st.text_input("Ticker Symbol", value="QQQ").upper().strip()
-    with col_start:
-        start_date = st.date_input("Start Date", value=datetime.today() - timedelta(days=5 * 365))
-    with col_end:
-        end_date = st.date_input("End Date", value=datetime.today())
-
-    bt_button = st.button("Run Backtest", type="primary")
-
-    if bt_button:
-        with st.spinner(f"Loading data and backtesting {bt_ticker}..."):
-            raw_data = yf.download(bt_ticker, start=start_date, end=end_date, progress=False)
-            if isinstance(raw_data.columns, pd.MultiIndex):
-                raw_data.columns = raw_data.columns.get_level_values(0)
-
-            if len(raw_data) < 150:
-                st.error("Insufficient historical data for the selected date range.")
+with tab2:
+    st.subheader("Historical Strategy Backtester")
+    
+    b_col1, b_col2, b_col3 = st.columns(3)
+    with b_col1:
+        bt_ticker = st.text_input("Ticker Symbol", value="TQQQ").upper()
+    with b_col2:
+        start_date = st.date_input("Start Date", value=datetime.today() - timedelta(days=5*365))
+    with b_col3:
+        initial_capital = st.number_input("Starting Capital ($)", value=10000.0, step=1000.0)
+        
+    if st.button("📈 Run Historical Backtest", type="primary"):
+        with st.spinner(f"Testing {bt_ticker}..."):
+            data = yf.download(bt_ticker, start=start_date, interval="1d", progress=False, auto_adjust=True)
+            
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = data.columns.get_level_values(0)
+                
+            if len(data) < 120:
+                st.error("Insufficient historical price history. Select an earlier start date.")
             else:
-                data_with_indicators = prepare_indicators(raw_data)
-                trade_log = run_backtest(
-                    data_with_indicators,
-                    W=W, X=X, Y=Y, Z=Z, N=N,
-                    min_price=min_price,
-                    min_volume=min_volume
+                trades_df, equity_df = run_backtest(
+                    data, W=W, X=X, Y=Y, Z=Z, N=N, initial_capital=initial_capital
                 )
-
-                if trade_log.empty:
-                    st.warning("No trades were triggered with the current parameters.")
+                
+                if trades_df.empty:
+                    st.warning("No trades triggered under these parameter values.")
                 else:
-                    # Performance Metrics
-                    total_trades = len(trade_log)
-                    wins = trade_log[trade_log['Return (%)'] > 0]
+                    total_trades = len(trades_df)
+                    wins = trades_df[trades_df['PnL ($)'] > 0]
                     win_rate = (len(wins) / total_trades) * 100.0
-                    avg_return = trade_log['Return (%)'].mean()
-                    total_comp_return = (np.prod(1 + trade_log['Return (%)'] / 100.0) - 1) * 100.0
+                    total_return = ((equity_df['Equity'].iloc[-1] / initial_capital) - 1) * 100.0
                     
-                    gross_profit = trade_log[trade_log['Return (%)'] > 0]['Return (%)'].sum()
-                    gross_loss = abs(trade_log[trade_log['Return (%)'] < 0]['Return (%)'].sum())
-                    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else np.nan
-
+                    gross_profit = trades_df.loc[trades_df['PnL ($)'] > 0, 'PnL ($)'].sum()
+                    gross_loss = abs(trades_df.loc[trades_df['PnL ($)'] < 0, 'PnL ($)'].sum())
+                    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else np.nan
+                    
+                    rolling_max = equity_df['Equity'].cummax()
+                    drawdown = (equity_df['Equity'] - rolling_max) / rolling_max
+                    max_dd = drawdown.min() * 100.0
+                    
                     m1, m2, m3, m4, m5 = st.columns(5)
                     m1.metric("Total Trades", total_trades)
                     m2.metric("Win Rate", f"{win_rate:.1f}%")
-                    m3.metric("Profit Factor", profit_factor if not np.isnan(profit_factor) else "∞")
-                    m4.metric("Avg Trade Return", f"{avg_return:.2f}%")
-                    m5.metric("Compound Strategy Return", f"{total_comp_return:.1f}%")
-
-                    # Cumulative Equity Curve
-                    trade_log['Cumulative Equity'] = (1 + trade_log['Return (%)'] / 100.0).cumprod() * 100.0
+                    m3.metric("Total Return", f"{total_return:.1f}%")
+                    m4.metric("Profit Factor", f"{profit_factor:.2f}" if not np.isnan(profit_factor) else "N/A")
+                    m5.metric("Max Drawdown", f"{max_dd:.1f}%")
+                    
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(
-                        x=trade_log['Exit Date'],
-                        y=trade_log['Cumulative Equity'],
-                        mode='lines+markers',
-                        name='Equity Curve',
-                        line=dict(color='#2962FF', width=2)
+                        x=equity_df.index,
+                        y=equity_df['Equity'],
+                        mode='lines',
+                        name='Portfolio Value',
+                        line=dict(color='#00C805', width=2)
                     ))
                     fig.update_layout(
-                        title=f"{bt_ticker} - Strategy Equity Curve (Base = 100)",
-                        xaxis_title="Exit Date",
-                        yaxis_title="Normalized Portfolio Value",
+                        title=f"{bt_ticker} Strategy Equity Curve",
+                        xaxis_title="Date",
+                        yaxis_title="Portfolio Equity ($)",
                         template="plotly_white",
-                        height=450
+                        hovermode="x unified"
                     )
                     st.plotly_chart(fig, use_container_width=True)
-
-                    st.write("### Trade Log")
-                    st.dataframe(trade_log, use_container_width=True)
-
-# ------------------------------------------
-# TAB 3: STRATEGY RULES
-# ------------------------------------------
-with tab_rules:
-    st.markdown("""
-    ### ConnorsRSI Pullback Strategy Architecture
-    
-    1. **Price Floor:** Stock price must be above **$5.00** per share.
-    2. **Liquidity Filter:** 21-day simple moving average volume $\ge$ **250,000 shares/day**.
-    3. **Trend Strength:** 10-day Average Directional Index (ADX) > **30.0**.
-    4. **Intraday Washout:** Today's Low drops at least **W%** ($W \in \{2, 4, 6, 8\}$) below yesterday's closing price.
-    5. **Weak Close:** Today's Close finishes in the bottom **X%** ($X \in \{10, 25\}$) of today's total range $(High - Low)$.
-    6. **Deep Oversold Oscillator:** ConnorsRSI(3, 2, 100) < **Y** ($Y \in [5, 15]$).
-    7. **Execution (Tomorrow):** Place an intraday limit order **Z%** ($Z \in \{4, 6, 8, 10\}$) below today's close.
-    8. **Exit:** Liquidate the position at the close on the first day ConnorsRSI(3, 2, 100) closes above **N** ($N \in \{50, 60, 70, 80\}$).
-    """)
+                    
+                    st.subheader("Executed Trade Log")
+                    st.dataframe(trades_df, use_container_width=True)
