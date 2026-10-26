@@ -4,16 +4,15 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-import urllib.request
 
 st.set_page_config(
-    page_title="ConnorsRSI Pullback Scanner & Backtester",
+    page_title="ConnorsRSI 2-Day Bucket Backtester",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # ==========================================
-# 1. TECHNICAL INDICATORS (PURE VECTORIZED)
+# 1. INDICATORS & CRSI CALCULATIONS
 # ==========================================
 
 def calculate_rsi(series: pd.Series, period: int) -> pd.Series:
@@ -30,7 +29,7 @@ def calculate_rsi(series: pd.Series, period: int) -> pd.Series:
     return rsi.fillna(50)
 
 def calculate_streak(close: pd.Series) -> pd.Series:
-    """Consecutive up/down close days counter."""
+    """Calculates consecutive days of higher closes (+) or lower closes (-)."""
     diff = close.diff()
     streak = np.zeros(len(close))
     for i in range(1, len(close)):
@@ -52,132 +51,107 @@ def calculate_percent_rank(series: pd.Series, period: int = 100) -> pd.Series:
 
     return pct_change.rolling(period + 1).apply(rolling_rank, raw=True).fillna(50)
 
-def calculate_connors_rsi(close: pd.Series, rsi_len: int = 3, streak_len: int = 2, rank_len: int = 100) -> pd.Series:
-    """ConnorsRSI(3, 2, 100)."""
-    rsi_price = calculate_rsi(close, rsi_len)
-    streak = calculate_streak(close)
-    rsi_streak = calculate_rsi(streak, streak_len)
-    pct_rank = calculate_percent_rank(close, rank_len)
-    return (rsi_price + rsi_streak + pct_rank) / 3.0
-
-def calculate_adx(df: pd.DataFrame, period: int = 10) -> pd.Series:
-    """10-day Average Directional Index (ADX) using Wilder's smoothing."""
-    high, low, close = df['High'], df['Low'], df['Close']
-    prev_close = close.shift(1)
-    
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    
-    up_move = high - high.shift(1)
-    down_move = low.shift(1) - low
-    
-    pos_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
-    neg_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
-    
-    tr_smooth = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    pos_dm_smooth = pos_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    neg_dm_smooth = neg_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    
-    pos_di = 100 * (pos_dm_smooth / tr_smooth.replace(0, np.nan))
-    neg_di = 100 * (neg_dm_smooth / tr_smooth.replace(0, np.nan))
-    
-    dx = 100 * ((pos_di - neg_di).abs() / (pos_di + neg_di).replace(0, np.nan))
-    adx = dx.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    return adx.fillna(0)
-
-def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Pre-computes indicators and setup conditions."""
+def prepare_crsi_data(df: pd.DataFrame, x_days: int) -> pd.DataFrame:
+    """Computes ConnorsRSI(3,2,100), its 2-day SMA, and rolling X-day highs."""
     df = df.copy()
-    df['SMA21_Vol'] = df['Volume'].rolling(21).mean()
-    df['ADX10'] = calculate_adx(df, 10)
-    df['CRSI'] = calculate_connors_rsi(df['Close'], 3, 2, 100)
+    rsi_p = calculate_rsi(df['Close'], 3)
+    rsi_s = calculate_rsi(calculate_streak(df['Close']), 2)
+    pr = calculate_percent_rank(df['Close'], 100)
     
-    day_range = (df['High'] - df['Low']).replace(0, np.nan)
-    df['Close_Range_Pct'] = ((df['Close'] - df['Low']) / day_range) * 100.0
-    df['Intraday_Drop_Pct'] = ((df['Close'].shift(1) - df['Low']) / df['Close'].shift(1)) * 100.0
+    df['CRSI'] = (rsi_p + rsi_s + pr) / 3.0
+    df['CRSI_2D'] = df['CRSI'].rolling(2).mean()
+    
+    # Prior X-day highest high (excluding current bar to avoid lookahead)
+    df['X_Day_High'] = df['High'].shift(1).rolling(x_days).max()
     return df
 
 # ==========================================
-# 2. TICKER UNIVERSE RETRIEVAL
+# 2. BUCKET DEFINITIONS & BACKTEST ENGINE
 # ==========================================
 
-MAJOR_ETFS = [
-    "SPY", "QQQ", "IWM", "DIA", "SMH", "SOXX", "XLF", "XLE", "XLK", "XLV", "XLI", 
-    "XLP", "XLU", "XLY", "XLC", "XLB", "XBI", "ARKK", "GLD", "SLV", "TLT", "HYG", 
-    "EEM", "EFA", "FXI", "KWEB", "VNQ", "TQQQ", "SQQQ", "SOXL", "SPXL", "UVXY"
-]
+BUCKET_RANGES = {
+    "0 - 10": (0.0, 10.0),
+    "11 - 20": (10.0001, 20.0),
+    "21 - 30": (20.0001, 30.0),
+    "31 - 40": (30.0001, 40.0),
+    "41 - 50": (40.0001, 50.0),
+    "51 - 60": (50.0001, 60.0),
+    "61 - 70": (60.0001, 70.0),
+    "71 - 80": (70.0001, 80.0),
+    "81 - 90": (80.0001, 90.0),
+    "91 - 100": (90.0001, 100.0),
+}
 
-TOP_ADRS = [
-    "TSM", "BABA", "ASML", "NVO", "AZN", "SAP", "TM", "HDB", "SE", "PDD", "MELI", 
-    "NIO", "BIDU", "JD", "INFY", "BNS", "BP", "SHEL", "RIO", "VALE", "SNY", "GSK", 
-    "SAN", "DEO", "UL", "ABB", "RELX", "ARGX", "SONY", "MUFG"
-]
-
-RUSSELL_LEADERS = [
-    "PLTR", "HOOD", "AFRM", "SOFI", "RBLX", "COIN", "DKNG", "SNAP", "DASH", "PINS",
-    "CRWD", "NET", "SNOW", "PANW", "ZS", "MDB", "DDOG", "TTD", "ENPH", "CELH",
-    "SYM", "PATH", "IONQ", "SMCI", "ARM", "RIVN", "LCID", "MARA", "RIOT", "CLSK"
-]
-
-@st.cache_data(ttl=86400)
-def get_sp500_tickers() -> list:
-    try:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response:
-            tables = pd.read_html(response)
-        tickers = tables[0]['Symbol'].str.replace('.', '-', regex=False).tolist()
-        return sorted(list(set(tickers)))
-    except Exception:
-        return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "BRK-B", "JPM", "V", "UNH"]
-
-@st.cache_data(ttl=86400)
-def get_nasdaq100_tickers() -> list:
-    try:
-        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response:
-            tables = pd.read_html(response)
-        tickers = tables[4]['Ticker'].str.replace('.', '-', regex=False).tolist()
-        return sorted(list(set(tickers)))
-    except Exception:
-        return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "COST", "AVGO", "TSLA", "AMD"]
-
-# ==========================================
-# 3. BACKTESTER ENGINE
-# ==========================================
-
-def run_backtest(df: pd.DataFrame, W: float, X: float, Y: float, Z: float, N: float, initial_capital: float = 10000.0):
-    df = prepare_data(df)
-    
-    cond1 = df['Close'] > 5.0
-    cond2 = df['SMA21_Vol'] >= 250000
-    cond3 = df['ADX10'] > 30.0
-    cond4 = df['Intraday_Drop_Pct'] >= W
-    cond5 = df['Close_Range_Pct'] <= X
-    cond6 = df['CRSI'] < Y
-    
-    df['Setup_Signal'] = cond1 & cond2 & cond3 & cond4 & cond5 & cond6
-    
+def backtest_bucket(
+    df: pd.DataFrame, 
+    low_b: float, 
+    high_b: float, 
+    exit_mode: str, 
+    crsi_exit_thresh: float, 
+    entry_timing: str = "Next Open",
+    initial_capital: float = 10000.0
+):
     trades = []
     in_trade = False
     entry_price = 0.0
     entry_date = None
     shares = 0
     capital = initial_capital
-    portfolio_values = []
+    portfolio = []
     
     dates = df.index
-    for i in range(1, len(df)):
+    n = len(df)
+    
+    # Signal mask: 2-day CRSI inside bucket
+    signal = (df['CRSI_2D'] >= low_b) & (df['CRSI_2D'] <= high_b)
+    
+    for i in range(1, n):
         curr_date = dates[i]
+        curr_close = df['Close'].iloc[i]
+        curr_open = df['Open'].iloc[i]
+        curr_high = df['High'].iloc[i]
+        curr_crsi_2d = df['CRSI_2D'].iloc[i]
+        x_high = df['X_Day_High'].iloc[i]
         
-        # Rule 8: Exit at close when CRSI > N
+        # 1. Manage Active Trade Exits
         if in_trade:
-            if df['CRSI'].iloc[i] > N:
-                exit_price = df['Close'].iloc[i]
+            hit_crsi = curr_crsi_2d > crsi_exit_thresh
+            hit_x_high = pd.notna(x_high) and (curr_high >= x_high)
+            
+            should_exit = False
+            exit_price = curr_close
+            exit_reason = ""
+            
+            if exit_mode == "Either (Whichever occurs first)":
+                if hit_x_high and hit_crsi:
+                    exit_price = max(curr_open, x_high)
+                    exit_reason = "Both (X-High & CRSI)"
+                    should_exit = True
+                elif hit_x_high:
+                    exit_price = max(curr_open, x_high)
+                    exit_reason = "X-Day High"
+                    should_exit = True
+                elif hit_crsi:
+                    exit_price = curr_close
+                    exit_reason = f"CRSI 2D > {crsi_exit_thresh}"
+                    should_exit = True
+            elif exit_mode == "Both Required":
+                if hit_x_high and hit_crsi:
+                    exit_price = curr_close
+                    exit_reason = "Both Met"
+                    should_exit = True
+            elif exit_mode == "X-Day High Only":
+                if hit_x_high:
+                    exit_price = max(curr_open, x_high)
+                    exit_reason = "X-Day High"
+                    should_exit = True
+            elif exit_mode == "2-Day CRSI Threshold Only":
+                if hit_crsi:
+                    exit_price = curr_close
+                    exit_reason = f"CRSI 2D > {crsi_exit_thresh}"
+                    should_exit = True
+                    
+            if should_exit:
                 pnl = (exit_price - entry_price) * shares
                 ret_pct = ((exit_price / entry_price) - 1) * 100
                 capital += (shares * exit_price)
@@ -187,6 +161,7 @@ def run_backtest(df: pd.DataFrame, W: float, X: float, Y: float, Z: float, N: fl
                     'Entry Price': round(entry_price, 2),
                     'Exit Date': curr_date,
                     'Exit Price': round(exit_price, 2),
+                    'Exit Reason': exit_reason,
                     'Hold Days': (curr_date - entry_date).days,
                     'Return %': round(ret_pct, 2),
                     'PnL ($)': round(pnl, 2),
@@ -194,271 +169,230 @@ def run_backtest(df: pd.DataFrame, W: float, X: float, Y: float, Z: float, N: fl
                 })
                 in_trade = False
                 shares = 0
-        
-        # Rule 7: Entry limit order Z% below yesterday's close
-        if not in_trade and df['Setup_Signal'].iloc[i - 1]:
-            limit_price = df['Close'].iloc[i - 1] * (1 - (Z / 100.0))
-            if df['Low'].iloc[i] <= limit_price:
-                entry_price = min(df['Open'].iloc[i], limit_price)
+
+        # 2. Check for New Entries
+        if not in_trade:
+            if entry_timing == "Next Open" and signal.iloc[i - 1]:
+                entry_price = curr_open
                 entry_date = curr_date
                 shares = int(capital // entry_price)
                 if shares > 0:
                     capital -= (shares * entry_price)
                     in_trade = True
+            elif entry_timing == "Signal Day Close" and signal.iloc[i]:
+                entry_price = curr_close
+                entry_date = curr_date
+                shares = int(capital // entry_price)
+                if shares > 0:
+                    capital -= (shares * entry_price)
+                    in_trade = True
+                    
+        curr_eq = capital + (shares * curr_close if in_trade else 0)
+        portfolio.append({'Date': curr_date, 'Equity': curr_eq})
         
-        current_equity = capital + (shares * df['Close'].iloc[i] if in_trade else 0)
-        portfolio_values.append({'Date': curr_date, 'Equity': current_equity})
-        
-    equity_df = pd.DataFrame(portfolio_values).set_index('Date') if portfolio_values else pd.DataFrame()
     trades_df = pd.DataFrame(trades)
+    equity_df = pd.DataFrame(portfolio).set_index('Date') if portfolio else pd.DataFrame()
     return trades_df, equity_df
 
 # ==========================================
-# 4. SIDEBAR CONFIGURATION (UPDATED RANGES)
+# 3. SIDEBAR CONTROLS
 # ==========================================
 
-st.sidebar.header("Strategy Rules Parameters")
+st.sidebar.title("Configuration")
 
-# W: 0 to 10, < 10
-W = st.sidebar.slider(
-    "Rule 4: Low % Drop Below Prev Close (W)",
-    min_value=0.0,
-    max_value=9.9,
-    value=4.0,
-    step=0.1,
-    help="Today's low must drop at least W% below yesterday's close (< 10%)."
+ticker = st.sidebar.text_input("Ticker Symbol", value="SPY").upper()
+start_date = st.sidebar.date_input("Start Date", value=datetime.today() - timedelta(days=10*365))
+capital = st.sidebar.number_input("Starting Capital ($)", value=10000.0, step=1000.0)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Exit Rules")
+
+exit_mode = st.sidebar.selectbox(
+    "Exit Condition Logic",
+    [
+        "Either (Whichever occurs first)",
+        "X-Day High Only",
+        "2-Day CRSI Threshold Only",
+        "Both Required"
+    ]
 )
 
-# X: 0 to 100, step 5
-X = st.sidebar.slider(
-    "Rule 5: Max % of Day's Range for Close (X)",
-    min_value=0,
-    max_value=100,
-    value=25,
-    step=5,
-    help="Today's close must sit in the bottom X% of the day's total range."
+x_days = st.sidebar.slider("X-Day High Period (Days)", min_value=1, max_value=20, value=5, step=1)
+
+crsi_exit_thresh = st.sidebar.selectbox(
+    "2-Day CRSI Exit Threshold",
+    options=[0, 10, 20, 30, 40, 50, 60, 70, 80, 90],
+    index=7  # Default 70
 )
 
-# Y: 5 to 95, step 5
-Y = st.sidebar.slider(
-    "Rule 6: ConnorsRSI Entry Threshold (< Y)",
-    min_value=5,
-    max_value=95,
-    value=10,
-    step=5,
-    help="ConnorsRSI(3,2,100) must close below Y."
-)
-
-# Z: 0 to 10
-Z = st.sidebar.slider(
-    "Rule 7: Tomorrow's Limit % Below Close (Z)",
-    min_value=0.0,
-    max_value=10.0,
-    value=4.0,
-    step=0.5,
-    help="Intraday limit order placed Z% below today's closing price."
-)
-
-# N: 0 to 90, step 10
-N = st.sidebar.slider(
-    "Rule 8: ConnorsRSI Exit Threshold (> N)",
-    min_value=0,
-    max_value=90,
-    value=70,
-    step=10,
-    help="Exit position at market close when ConnorsRSI crosses above N."
-)
+entry_timing = st.sidebar.radio("Entry Execution", ["Next Open", "Signal Day Close"], horizontal=True)
 
 # ==========================================
-# 5. TABS: SCANNER & BACKTESTER
+# 4. APP WORKFLOW
 # ==========================================
 
-tab1, tab2 = st.tabs(["🔍 Market Scanner (Tomorrow's Setups)", "📊 Strategy Backtester"])
+@st.cache_data(ttl=3600)
+def load_data(symbol: str, start: datetime):
+    df = yf.download(symbol, start=start, interval="1d", progress=False, auto_adjust=True)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+raw_df = load_data(ticker, start_date)
+
+if raw_df.empty or len(raw_df) < 120:
+    st.error("Insufficient market data. Please verify the ticker or pick an earlier start date.")
+    st.stop()
+
+processed_df = prepare_crsi_data(raw_df, x_days=x_days)
+
+tab1, tab2 = st.tabs(["📊 All Buckets Study (Larry Connors Matrix)", "📈 Single Bucket Deep Dive"])
 
 # ------------------------------------------
-# TAB 1: SCANNER
+# TAB 1: ALL BUCKETS MATRIX
 # ------------------------------------------
 with tab1:
-    st.subheader("ConnorsRSI Pullback Scanner")
-    st.markdown("Scans selected indices and universes for stocks meeting Rules 1–6 on the latest market close.")
-    
-    selected_universes = st.multiselect(
-        "Select Universes to Include in Scan:",
-        ["S&P 500", "Nasdaq 100", "Russell Leaders / Growth", "Major US ETFs", "Top Global ADRs"],
-        default=["S&P 500", "Nasdaq 100", "Major US ETFs"]
+    st.subheader(f"2-Day ConnorsRSI Bucket Study — {ticker}")
+    st.caption(
+        f"Comparing trade performance when entering on specific 2-Day CRSI bands. "
+        f"Exit Mode: {exit_mode} | X-Day High: {x_days} | CRSI Exit Threshold: > {crsi_exit_thresh}"
     )
     
-    custom_tickers = st.text_input("Add Extra Custom Tickers (Comma-separated, optional):", value="")
+    matrix_rows = []
+    bucket_results = {}
     
-    col_scan, col_cap = st.columns([1, 2])
-    with col_scan:
-        start_scan = st.button("🚀 Run Market Scan", type="primary")
-    with col_cap:
-        scan_limit = st.slider("Max Tickers to Scan (prevents API rate limits)", min_value=50, max_value=800, value=300, step=50)
-
-    if start_scan:
-        universe_list = []
-        if "S&P 500" in selected_universes:
-            universe_list.extend(get_sp500_tickers())
-        if "Nasdaq 100" in selected_universes:
-            universe_list.extend(get_nasdaq100_tickers())
-        if "Russell Leaders / Growth" in selected_universes:
-            universe_list.extend(RUSSELL_LEADERS)
-        if "Major US ETFs" in selected_universes:
-            universe_list.extend(MAJOR_ETFS)
-        if "Top Global ADRs" in selected_universes:
-            universe_list.extend(TOP_ADRS)
-            
-        if custom_tickers.strip():
-            universe_list.extend([t.strip().upper() for t in custom_tickers.split(",") if t.strip()])
-            
-        # Deduplicate and apply limit
-        all_tickers = sorted(list(set(universe_list)))[:scan_limit]
+    for b_name, (lb, hb) in BUCKET_RANGES.items():
+        tdf, eqdf = backtest_bucket(
+            df=processed_df,
+            low_b=lb,
+            high_b=hb,
+            exit_mode=exit_mode,
+            crsi_exit_thresh=crsi_exit_thresh,
+            entry_timing=entry_timing,
+            initial_capital=capital
+        )
+        bucket_results[b_name] = (tdf, eqdf)
         
-        st.info(f"Scanning {len(all_tickers)} tickers in fast parallel batches...")
-        progress_bar = st.progress(0.0)
-        status_text = st.empty()
-        
-        candidates = []
-        batch_size = 50
-        num_batches = int(np.ceil(len(all_tickers) / batch_size))
-        
-        for b in range(num_batches):
-            batch = all_tickers[b * batch_size : (b + 1) * batch_size]
-            status_text.text(f"Fetching batch {b + 1}/{num_batches} ({len(batch)} tickers)...")
+        n_trades = len(tdf)
+        if n_trades > 0:
+            wins = tdf[tdf['PnL ($)'] > 0]
+            win_rate = (len(wins) / n_trades) * 100.0
+            avg_ret = tdf['Return %'].mean()
+            tot_pnl = tdf['PnL ($)'].sum()
+            avg_days = tdf['Hold Days'].mean()
             
-            try:
-                # Batched download for maximum performance
-                batch_data = yf.download(
-                    tickers=batch,
-                    period="1y",
-                    interval="1d",
-                    group_by="ticker",
-                    auto_adjust=True,
-                    progress=False,
-                    threads=True
-                )
-                
-                for ticker in batch:
-                    try:
-                        # Extract ticker data from single or multi-index structure
-                        if isinstance(batch_data.columns, pd.MultiIndex):
-                            if ticker in batch_data.columns.get_level_values(0):
-                                df_t = batch_data[ticker].dropna(how='all')
-                            elif ticker in batch_data.columns.get_level_values(1):
-                                df_t = batch_data.xs(ticker, axis=1, level=1).dropna(how='all')
-                            else:
-                                continue
-                        else:
-                            df_t = batch_data.dropna(how='all')
-                            
-                        if len(df_t) >= 120:
-                            df_calc = prepare_data(df_t)
-                            latest = df_calc.iloc[-1]
-                            
-                            # Rule 1 to 6 Validation
-                            r1 = latest['Close'] > 5.0
-                            r2 = latest['SMA21_Vol'] >= 250000
-                            r3 = latest['ADX10'] > 30.0
-                            r4 = latest['Intraday_Drop_Pct'] >= W
-                            r5 = latest['Close_Range_Pct'] <= X
-                            r6 = latest['CRSI'] < Y
-                            
-                            if r1 and r2 and r3 and r4 and r5 and r6:
-                                limit_buy = latest['Close'] * (1 - (Z / 100.0))
-                                candidates.append({
-                                    "Ticker": ticker,
-                                    "Close Price": f"${latest['Close']:.2f}",
-                                    "Tomorrow Limit Buy": f"${limit_buy:.2f}",
-                                    "ConnorsRSI": f"{latest['CRSI']:.2f}",
-                                    "ADX(10)": f"{latest['ADX10']:.2f}",
-                                    "Range %": f"{latest['Close_Range_Pct']:.1f}%",
-                                    "Drop from Prev Close %": f"{latest['Intraday_Drop_Pct']:.1f}%",
-                                    "21-Day Avg Vol": f"{int(latest['SMA21_Vol']):,}"
-                                })
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+            gross_p = tdf.loc[tdf['PnL ($)'] > 0, 'PnL ($)'].sum()
+            gross_l = abs(tdf.loc[tdf['PnL ($)'] < 0, 'PnL ($)'].sum())
+            pf = (gross_p / gross_l) if gross_l > 0 else (np.inf if gross_p > 0 else 0.0)
             
-            progress_bar.progress((b + 1) / num_batches)
-            
-        progress_bar.empty()
-        status_text.empty()
-        
-        if candidates:
-            st.success(f"Found {len(candidates)} candidate(s) triggering entry orders for tomorrow!")
-            st.dataframe(pd.DataFrame(candidates), use_container_width=True)
+            # Max Drawdown
+            roll_max = eqdf['Equity'].cummax()
+            dd = (eqdf['Equity'] - roll_max) / roll_max
+            mdd = dd.min() * 100.0
         else:
-            st.warning("No tickers met all 6 entry criteria under the current parameter thresholds.")
+            win_rate = avg_ret = tot_pnl = pf = mdd = avg_days = 0.0
+
+        matrix_rows.append({
+            "2-Day CRSI Bucket": b_name,
+            "Total Trades": n_trades,
+            "Win Rate %": round(win_rate, 1),
+            "Avg Return %": round(avg_ret, 2),
+            "Profit Factor": round(pf, 2) if pf != np.inf else "∞",
+            "Total PnL ($)": round(tot_pnl, 2),
+            "Max Drawdown %": round(mdd, 1),
+            "Avg Hold (Days)": round(avg_days, 1)
+        })
+        
+    summary_table = pd.DataFrame(matrix_rows)
+    
+    # Render table with styled win rate highlights
+    st.dataframe(
+        summary_table.style.format({
+            "Win Rate %": "{:.1f}%",
+            "Avg Return %": "{:.2f}%",
+            "Total PnL ($)": "${:,.2f}",
+            "Max Drawdown %": "{:.1f}%",
+            "Avg Hold (Days)": "{:.1f}"
+        }),
+        use_container_width=True
+    )
+    
+    # Comparative Bar Charts
+    fig_bar = go.Figure()
+    fig_bar.add_trace(go.Bar(
+        x=summary_table["2-Day CRSI Bucket"],
+        y=summary_table["Win Rate %"],
+        name="Win Rate %",
+        marker_color="#2962FF"
+    ))
+    fig_bar.add_trace(go.Bar(
+        x=summary_table["2-Day CRSI Bucket"],
+        y=summary_table["Avg Return %"],
+        name="Avg Return % per Trade",
+        yaxis="y2",
+        marker_color="#00C805"
+    ))
+    fig_bar.update_layout(
+        title="Win Rate and Average Trade Return by 2-Day CRSI Bucket",
+        xaxis_title="2-Day CRSI Range",
+        yaxis=dict(title="Win Rate (%)", side="left", range=[0, 100]),
+        yaxis2=dict(title="Avg Return (%)", side="right", overlaying="y"),
+        legend=dict(x=0.01, y=0.99),
+        template="plotly_white",
+        barmode="group",
+        height=450
+    )
+    st.plotly_chart(fig_bar, use_container_width=True)
 
 # ------------------------------------------
-# TAB 2: BACKTESTER
+# TAB 2: DETAILED SINGLE BUCKET
 # ------------------------------------------
 with tab2:
-    st.subheader("Historical Strategy Backtester")
+    selected_bucket = st.selectbox("Select Bucket to Inspect:", list(BUCKET_RANGES.keys()), index=0)
+    tdf_sel, eqdf_sel = bucket_results[selected_bucket]
     
-    b_col1, b_col2, b_col3 = st.columns(3)
-    with b_col1:
-        bt_ticker = st.text_input("Ticker Symbol", value="TQQQ").upper()
-    with b_col2:
-        start_date = st.date_input("Start Date", value=datetime.today() - timedelta(days=5*365))
-    with b_col3:
-        initial_capital = st.number_input("Starting Capital ($)", value=10000.0, step=1000.0)
+    if tdf_sel.empty:
+        st.warning(f"No trades were triggered for bucket '{selected_bucket}' with current parameters.")
+    else:
+        wins = tdf_sel[tdf_sel['PnL ($)'] > 0]
+        losses = tdf_sel[tdf_sel['PnL ($)'] < 0]
+        win_rate = (len(wins) / len(tdf_sel)) * 100.0
+        tot_return = ((eqdf_sel['Equity'].iloc[-1] / capital) - 1) * 100.0
         
-    if st.button("📈 Run Historical Backtest", type="primary"):
-        with st.spinner(f"Testing {bt_ticker}..."):
-            data = yf.download(bt_ticker, start=start_date, interval="1d", progress=False, auto_adjust=True)
-            
-            if isinstance(data.columns, pd.MultiIndex):
-                data.columns = data.columns.get_level_values(0)
-                
-            if len(data) < 120:
-                st.error("Insufficient historical price history. Select an earlier start date.")
-            else:
-                trades_df, equity_df = run_backtest(
-                    data, W=W, X=X, Y=Y, Z=Z, N=N, initial_capital=initial_capital
-                )
-                
-                if trades_df.empty:
-                    st.warning("No trades triggered under these parameter values.")
-                else:
-                    total_trades = len(trades_df)
-                    wins = trades_df[trades_df['PnL ($)'] > 0]
-                    win_rate = (len(wins) / total_trades) * 100.0
-                    total_return = ((equity_df['Equity'].iloc[-1] / initial_capital) - 1) * 100.0
-                    
-                    gross_profit = trades_df.loc[trades_df['PnL ($)'] > 0, 'PnL ($)'].sum()
-                    gross_loss = abs(trades_df.loc[trades_df['PnL ($)'] < 0, 'PnL ($)'].sum())
-                    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else np.nan
-                    
-                    rolling_max = equity_df['Equity'].cummax()
-                    drawdown = (equity_df['Equity'] - rolling_max) / rolling_max
-                    max_dd = drawdown.min() * 100.0
-                    
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("Total Trades", total_trades)
-                    m2.metric("Win Rate", f"{win_rate:.1f}%")
-                    m3.metric("Total Return", f"{total_return:.1f}%")
-                    m4.metric("Profit Factor", f"{profit_factor:.2f}" if not np.isnan(profit_factor) else "N/A")
-                    m5.metric("Max Drawdown", f"{max_dd:.1f}%")
-                    
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=equity_df.index,
-                        y=equity_df['Equity'],
-                        mode='lines',
-                        name='Portfolio Value',
-                        line=dict(color='#00C805', width=2)
-                    ))
-                    fig.update_layout(
-                        title=f"{bt_ticker} Strategy Equity Curve",
-                        xaxis_title="Date",
-                        yaxis_title="Portfolio Equity ($)",
-                        template="plotly_white",
-                        hovermode="x unified"
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    st.subheader("Executed Trade Log")
-                    st.dataframe(trades_df, use_container_width=True)
+        gross_p = wins['PnL ($)'].sum()
+        gross_l = abs(losses['PnL ($)'].sum())
+        pf = (gross_p / gross_l) if gross_l > 0 else np.nan
+        
+        roll_max = eqdf_sel['Equity'].cummax()
+        dd = (eqdf_sel['Equity'] - roll_max) / roll_max
+        max_dd = dd.min() * 100.0
+        
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Trades", len(tdf_sel))
+        m2.metric("Win Rate", f"{win_rate:.1f}%")
+        m3.metric("Total Return", f"{tot_return:.1f}%")
+        m4.metric("Profit Factor", f"{pf:.2f}" if not np.isnan(pf) else "N/A")
+        m5.metric("Max Drawdown", f"{max_dd:.1f}%")
+        
+        # Equity Curve
+        fig_eq = go.Figure()
+        fig_eq.add_trace(go.Scatter(
+            x=eqdf_sel.index,
+            y=eqdf_sel['Equity'],
+            mode='lines',
+            line=dict(color='#00C805', width=2),
+            name="Portfolio Value"
+        ))
+        fig_eq.update_layout(
+            title=f"Equity Curve: Bucket [{selected_bucket}] on {ticker}",
+            xaxis_title="Date",
+            yaxis_title="Portfolio Equity ($)",
+            template="plotly_white",
+            hovermode="x unified",
+            height=400
+        )
+        st.plotly_chart(fig_eq, use_container_width=True)
+        
+        # Trade Log
+        st.subheader("Executed Trades")
+        st.dataframe(tdf_sel, use_container_width=True)
