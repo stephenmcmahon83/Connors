@@ -4,15 +4,16 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import urllib.request
 
 st.set_page_config(
-    page_title="ConnorsRSI 2-Day Bucket Backtester",
+    page_title="ConnorsRSI 2-Day Bucket Backtester & Screener",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # ==========================================
-# 1. INDICATORS & CRSI CALCULATIONS
+# 1. CORE TECHNICAL INDICATORS
 # ==========================================
 
 def calculate_rsi(series: pd.Series, period: int) -> pd.Series:
@@ -29,7 +30,7 @@ def calculate_rsi(series: pd.Series, period: int) -> pd.Series:
     return rsi.fillna(50)
 
 def calculate_streak(close: pd.Series) -> pd.Series:
-    """Calculates consecutive days of higher closes (+) or lower closes (-)."""
+    """Consecutive up/down close days counter."""
     diff = close.diff()
     streak = np.zeros(len(close))
     for i in range(1, len(close)):
@@ -60,13 +61,11 @@ def prepare_crsi_data(df: pd.DataFrame, x_days: int) -> pd.DataFrame:
     
     df['CRSI'] = (rsi_p + rsi_s + pr) / 3.0
     df['CRSI_2D'] = df['CRSI'].rolling(2).mean()
-    
-    # Prior X-day highest high (excluding current bar to avoid lookahead)
     df['X_Day_High'] = df['High'].shift(1).rolling(x_days).max()
     return df
 
 # ==========================================
-# 2. BUCKET DEFINITIONS & BACKTEST ENGINE
+# 2. BUCKET DEFINITIONS & BACKTEST LOGIC
 # ==========================================
 
 BUCKET_RANGES = {
@@ -100,12 +99,9 @@ def backtest_bucket(
     portfolio = []
     
     dates = df.index
-    n = len(df)
-    
-    # Signal mask: 2-day CRSI inside bucket
     signal = (df['CRSI_2D'] >= low_b) & (df['CRSI_2D'] <= high_b)
     
-    for i in range(1, n):
+    for i in range(1, len(df)):
         curr_date = dates[i]
         curr_close = df['Close'].iloc[i]
         curr_open = df['Open'].iloc[i]
@@ -113,7 +109,7 @@ def backtest_bucket(
         curr_crsi_2d = df['CRSI_2D'].iloc[i]
         x_high = df['X_Day_High'].iloc[i]
         
-        # 1. Manage Active Trade Exits
+        # 1. Manage Exits
         if in_trade:
             hit_crsi = curr_crsi_2d > crsi_exit_thresh
             hit_x_high = pd.notna(x_high) and (curr_high >= x_high)
@@ -170,7 +166,7 @@ def backtest_bucket(
                 in_trade = False
                 shares = 0
 
-        # 2. Check for New Entries
+        # 2. Manage Entries
         if not in_trade:
             if entry_timing == "Next Open" and signal.iloc[i - 1]:
                 entry_price = curr_open
@@ -195,17 +191,72 @@ def backtest_bucket(
     return trades_df, equity_df
 
 # ==========================================
-# 3. SIDEBAR CONTROLS
+# 3. UNIVERSES & CACHED LOADERS
 # ==========================================
 
-st.sidebar.title("Configuration")
+MAJOR_ETFS = [
+    "SPY", "QQQ", "IWM", "DIA", "SMH", "SOXX", "XLF", "XLE", "XLK", "XLV", "XLI", 
+    "XLP", "XLU", "XLY", "XLC", "XLB", "XBI", "ARKK", "GLD", "SLV", "TLT", "HYG", 
+    "EEM", "EFA", "FXI", "KWEB", "VNQ", "TQQQ", "SQQQ", "SOXL", "SPXL", "UVXY"
+]
 
-ticker = st.sidebar.text_input("Ticker Symbol", value="SPY").upper()
-start_date = st.sidebar.date_input("Start Date", value=datetime.today() - timedelta(days=10*365))
-capital = st.sidebar.number_input("Starting Capital ($)", value=10000.0, step=1000.0)
+TOP_ADRS = [
+    "TSM", "BABA", "ASML", "NVO", "AZN", "SAP", "TM", "HDB", "SE", "PDD", "MELI", 
+    "NIO", "BIDU", "JD", "INFY", "BNS", "BP", "SHEL", "RIO", "VALE", "SNY", "GSK", 
+    "SAN", "DEO", "UL", "ABB", "RELX", "ARGX", "SONY", "MUFG"
+]
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Exit Rules")
+RUSSELL_2000_LIQUID = [
+    "PLTR", "HOOD", "AFRM", "SOFI", "RBLX", "COIN", "DKNG", "SNAP", "DASH", "PINS",
+    "CRWD", "NET", "SNOW", "PANW", "ZS", "MDB", "DDOG", "TTD", "ENPH", "CELH",
+    "SYM", "PATH", "IONQ", "SMCI", "ARM", "RIVN", "LCID", "MARA", "RIOT", "CLSK",
+    "APP", "DUOL", "SAIA", "ELF", "FSLR", "ONTO", "POWI", "EXAS", "ACLX", "HALO",
+    "AXSM", "KNSL", "MEDP", "LNTH", "ALGM", "BOOT", "WING", "SHAK", "CAVA", "BLMN"
+]
+
+@st.cache_data(ttl=86400)
+def get_sp500_tickers() -> list:
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as resp:
+            tables = pd.read_html(resp)
+        return sorted(tables[0]['Symbol'].str.replace('.', '-', regex=False).tolist())
+    except Exception:
+        return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "BRK-B", "JPM", "V", "UNH"]
+
+@st.cache_data(ttl=86400)
+def get_nasdaq100_tickers() -> list:
+    try:
+        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as resp:
+            tables = pd.read_html(resp)
+        return sorted(tables[4]['Ticker'].str.replace('.', '-', regex=False).tolist())
+    except Exception:
+        return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "COST", "AVGO", "TSLA", "AMD"]
+
+# ==========================================
+# 4. SIDEBAR SETTINGS
+# ==========================================
+
+st.sidebar.title("Strategy Rules")
+
+selected_bucket_name = st.sidebar.selectbox(
+    "Entry 2-Day CRSI Bucket",
+    options=list(BUCKET_RANGES.keys()),
+    index=0,
+    help="Target bucket that triggers a buy signal."
+)
+target_lb, target_hb = BUCKET_RANGES[selected_bucket_name]
+
+x_days = st.sidebar.slider("Exit Rule: X-Day High Lookback", min_value=1, max_value=20, value=5, step=1)
+
+crsi_exit_thresh = st.sidebar.selectbox(
+    "Exit Rule: 2-Day CRSI Exit Threshold (> N)",
+    options=[0, 10, 20, 30, 40, 50, 60, 70, 80, 90],
+    index=7  # Default 70
+)
 
 exit_mode = st.sidebar.selectbox(
     "Exit Condition Logic",
@@ -217,182 +268,206 @@ exit_mode = st.sidebar.selectbox(
     ]
 )
 
-x_days = st.sidebar.slider("X-Day High Period (Days)", min_value=1, max_value=20, value=5, step=1)
-
-crsi_exit_thresh = st.sidebar.selectbox(
-    "2-Day CRSI Exit Threshold",
-    options=[0, 10, 20, 30, 40, 50, 60, 70, 80, 90],
-    index=7  # Default 70
-)
-
 entry_timing = st.sidebar.radio("Entry Execution", ["Next Open", "Signal Day Close"], horizontal=True)
 
 # ==========================================
-# 4. APP WORKFLOW
+# 5. TABS: SCREENER & BACKTESTERS
 # ==========================================
 
-@st.cache_data(ttl=3600)
-def load_data(symbol: str, start: datetime):
-    df = yf.download(symbol, start=start, interval="1d", progress=False, auto_adjust=True)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df
-
-raw_df = load_data(ticker, start_date)
-
-if raw_df.empty or len(raw_df) < 120:
-    st.error("Insufficient market data. Please verify the ticker or pick an earlier start date.")
-    st.stop()
-
-processed_df = prepare_crsi_data(raw_df, x_days=x_days)
-
-tab1, tab2 = st.tabs(["📊 All Buckets Study (Larry Connors Matrix)", "📈 Single Bucket Deep Dive"])
+tab_screen, tab_matrix, tab_deep = st.tabs([
+    "🔍 Live Market Screener",
+    "📊 All Buckets Study (Larry Connors Matrix)",
+    "📈 Single Bucket Deep Dive"
+])
 
 # ------------------------------------------
-# TAB 1: ALL BUCKETS MATRIX
+# TAB 1: LIVE MARKET SCREENER
 # ------------------------------------------
-with tab1:
-    st.subheader(f"2-Day ConnorsRSI Bucket Study — {ticker}")
+with tab_screen:
+    st.subheader("Market Screener: 2-Day ConnorsRSI, Signals & Open Positions")
     st.caption(
-        f"Comparing trade performance when entering on specific 2-Day CRSI bands. "
-        f"Exit Mode: {exit_mode} | X-Day High: {x_days} | CRSI Exit Threshold: > {crsi_exit_thresh}"
+        f"Scanning for entry bucket **[{selected_bucket_name}]** | Exit: **{exit_mode}** "
+        f"(X-High: {x_days}d, CRSI Exit: > {crsi_exit_thresh})"
     )
     
-    matrix_rows = []
-    bucket_results = {}
-    
-    for b_name, (lb, hb) in BUCKET_RANGES.items():
-        tdf, eqdf = backtest_bucket(
-            df=processed_df,
-            low_b=lb,
-            high_b=hb,
-            exit_mode=exit_mode,
-            crsi_exit_thresh=crsi_exit_thresh,
-            entry_timing=entry_timing,
-            initial_capital=capital
+    col_u1, col_u2 = st.columns([3, 1])
+    with col_u1:
+        universes_selected = st.multiselect(
+            "Select Universes to Scan:",
+            ["S&P 500", "Nasdaq 100", "Russell 2000 Liquid", "Major US ETFs", "Top Global ADRs"],
+            default=["Nasdaq 100", "Major US ETFs", "Top Global ADRs"]
         )
-        bucket_results[b_name] = (tdf, eqdf)
+    with col_u2:
+        max_scan = st.slider("Max Stocks to Scan", min_value=30, max_value=700, value=200, step=25)
         
-        n_trades = len(tdf)
-        if n_trades > 0:
-            wins = tdf[tdf['PnL ($)'] > 0]
-            win_rate = (len(wins) / n_trades) * 100.0
-            avg_ret = tdf['Return %'].mean()
-            tot_pnl = tdf['PnL ($)'].sum()
-            avg_days = tdf['Hold Days'].mean()
-            
-            gross_p = tdf.loc[tdf['PnL ($)'] > 0, 'PnL ($)'].sum()
-            gross_l = abs(tdf.loc[tdf['PnL ($)'] < 0, 'PnL ($)'].sum())
-            pf = (gross_p / gross_l) if gross_l > 0 else (np.inf if gross_p > 0 else 0.0)
-            
-            # Max Drawdown
-            roll_max = eqdf['Equity'].cummax()
-            dd = (eqdf['Equity'] - roll_max) / roll_max
-            mdd = dd.min() * 100.0
-        else:
-            win_rate = avg_ret = tot_pnl = pf = mdd = avg_days = 0.0
+    filter_actionable = st.checkbox("Show Only Actionable Stocks (Buy Signals, Open Positions, Exits)", value=False)
+    run_scan_btn = st.button("🚀 Run Live Screener", type="primary")
 
-        matrix_rows.append({
-            "2-Day CRSI Bucket": b_name,
-            "Total Trades": n_trades,
-            "Win Rate %": round(win_rate, 1),
-            "Avg Return %": round(avg_ret, 2),
-            "Profit Factor": round(pf, 2) if pf != np.inf else "∞",
-            "Total PnL ($)": round(tot_pnl, 2),
-            "Max Drawdown %": round(mdd, 1),
-            "Avg Hold (Days)": round(avg_days, 1)
-        })
+    if run_scan_btn:
+        tickers_to_scan = []
+        if "S&P 500" in universes_selected:
+            tickers_to_scan.extend(get_sp500_tickers())
+        if "Nasdaq 100" in universes_selected:
+            tickers_to_scan.extend(get_nasdaq100_tickers())
+        if "Russell 2000 Liquid" in universes_selected:
+            tickers_to_scan.extend(RUSSELL_2000_LIQUID)
+        if "Major US ETFs" in universes_selected:
+            tickers_to_scan.extend(MAJOR_ETFS)
+        if "Top Global ADRs" in universes_selected:
+            tickers_to_scan.extend(TOP_ADRS)
+            
+        tickers_to_scan = sorted(list(set(tickers_to_scan)))[:max_scan]
         
-    summary_table = pd.DataFrame(matrix_rows)
-    
-    # Render table with styled win rate highlights
-    st.dataframe(
-        summary_table.style.format({
-            "Win Rate %": "{:.1f}%",
-            "Avg Return %": "{:.2f}%",
-            "Total PnL ($)": "${:,.2f}",
-            "Max Drawdown %": "{:.1f}%",
-            "Avg Hold (Days)": "{:.1f}"
-        }),
-        use_container_width=True
-    )
-    
-    # Comparative Bar Charts
-    fig_bar = go.Figure()
-    fig_bar.add_trace(go.Bar(
-        x=summary_table["2-Day CRSI Bucket"],
-        y=summary_table["Win Rate %"],
-        name="Win Rate %",
-        marker_color="#2962FF"
-    ))
-    fig_bar.add_trace(go.Bar(
-        x=summary_table["2-Day CRSI Bucket"],
-        y=summary_table["Avg Return %"],
-        name="Avg Return % per Trade",
-        yaxis="y2",
-        marker_color="#00C805"
-    ))
-    fig_bar.update_layout(
-        title="Win Rate and Average Trade Return by 2-Day CRSI Bucket",
-        xaxis_title="2-Day CRSI Range",
-        yaxis=dict(title="Win Rate (%)", side="left", range=[0, 100]),
-        yaxis2=dict(title="Avg Return (%)", side="right", overlaying="y"),
-        legend=dict(x=0.01, y=0.99),
-        template="plotly_white",
-        barmode="group",
-        height=450
-    )
-    st.plotly_chart(fig_bar, use_container_width=True)
-
-# ------------------------------------------
-# TAB 2: DETAILED SINGLE BUCKET
-# ------------------------------------------
-with tab2:
-    selected_bucket = st.selectbox("Select Bucket to Inspect:", list(BUCKET_RANGES.keys()), index=0)
-    tdf_sel, eqdf_sel = bucket_results[selected_bucket]
-    
-    if tdf_sel.empty:
-        st.warning(f"No trades were triggered for bucket '{selected_bucket}' with current parameters.")
-    else:
-        wins = tdf_sel[tdf_sel['PnL ($)'] > 0]
-        losses = tdf_sel[tdf_sel['PnL ($)'] < 0]
-        win_rate = (len(wins) / len(tdf_sel)) * 100.0
-        tot_return = ((eqdf_sel['Equity'].iloc[-1] / capital) - 1) * 100.0
+        st.info(f"Scanning {len(tickers_to_scan)} tickers in fast parallel batches...")
+        progress_bar = st.progress(0.0)
+        status_box = st.empty()
         
-        gross_p = wins['PnL ($)'].sum()
-        gross_l = abs(losses['PnL ($)'].sum())
-        pf = (gross_p / gross_l) if gross_l > 0 else np.nan
+        results = []
+        batch_size = 50
+        num_batches = int(np.ceil(len(tickers_to_scan) / batch_size))
         
-        roll_max = eqdf_sel['Equity'].cummax()
-        dd = (eqdf_sel['Equity'] - roll_max) / roll_max
-        max_dd = dd.min() * 100.0
-        
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Trades", len(tdf_sel))
-        m2.metric("Win Rate", f"{win_rate:.1f}%")
-        m3.metric("Total Return", f"{tot_return:.1f}%")
-        m4.metric("Profit Factor", f"{pf:.2f}" if not np.isnan(pf) else "N/A")
-        m5.metric("Max Drawdown", f"{max_dd:.1f}%")
-        
-        # Equity Curve
-        fig_eq = go.Figure()
-        fig_eq.add_trace(go.Scatter(
-            x=eqdf_sel.index,
-            y=eqdf_sel['Equity'],
-            mode='lines',
-            line=dict(color='#00C805', width=2),
-            name="Portfolio Value"
-        ))
-        fig_eq.update_layout(
-            title=f"Equity Curve: Bucket [{selected_bucket}] on {ticker}",
-            xaxis_title="Date",
-            yaxis_title="Portfolio Equity ($)",
-            template="plotly_white",
-            hovermode="x unified",
-            height=400
-        )
-        st.plotly_chart(fig_eq, use_container_width=True)
-        
-        # Trade Log
-        st.subheader("Executed Trades")
-        st.dataframe(tdf_sel, use_container_width=True)
+        for b in range(num_batches):
+            batch = tickers_to_scan[b * batch_size : (b + 1) * batch_size]
+            status_box.text(f"Fetching batch {b + 1}/{num_batches} ({len(batch)} tickers)...")
+            
+            try:
+                raw_batch = yf.download(
+                    tickers=batch,
+                    period="1y",
+                    interval="1d",
+                    group_by="ticker",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=True
+                )
+                
+                for t in batch:
+                    try:
+                        if isinstance(raw_batch.columns, pd.MultiIndex):
+                            if t in raw_batch.columns.get_level_values(0):
+                                df_t = raw_batch[t].dropna(how='all')
+                            elif t in raw_batch.columns.get_level_values(1):
+                                df_t = raw_batch.xs(t, axis=1, level=1).dropna(how='all')
+                            else:
+                                continue
+                        else:
+                            df_t = raw_batch.dropna(how='all')
+                            
+                        if len(df_t) < 120:
+                            continue
+                            
+                        calc_df = prepare_crsi_data(df_t, x_days=x_days)
+                        
+                        # Simulate the past 40 sessions to evaluate active trade state
+                        sub_df = calc_df.iloc[-40:].copy()
+                        in_trade = False
+                        entry_price = 0.0
+                        entry_date = None
+                        
+                        for idx_bar in range(1, len(sub_df) - 1):
+                            bar_date = sub_df.index[idx_bar]
+                            b_close = sub_df['Close'].iloc[idx_bar]
+                            b_open = sub_df['Open'].iloc[idx_bar]
+                            b_high = sub_df['High'].iloc[idx_bar]
+                            b_crsi_2d = sub_df['CRSI_2D'].iloc[idx_bar]
+                            b_x_high = sub_df['X_Day_High'].iloc[idx_bar]
+                            
+                            # Exit logic on historical bar
+                            if in_trade:
+                                hit_c = b_crsi_2d > crsi_exit_thresh
+                                hit_xh = pd.notna(b_x_high) and (b_high >= b_x_high)
+                                exit_now = False
+                                if exit_mode == "Either (Whichever occurs first)" and (hit_c or hit_xh):
+                                    exit_now = True
+                                elif exit_mode == "Both Required" and (hit_c and hit_xh):
+                                    exit_now = True
+                                elif exit_mode == "X-Day High Only" and hit_xh:
+                                    exit_now = True
+                                elif exit_mode == "2-Day CRSI Threshold Only" and hit_c:
+                                    exit_now = True
+                                if exit_now:
+                                    in_trade = False
+                                    
+                            # Entry logic on historical bar
+                            if not in_trade:
+                                prev_sig = (sub_df['CRSI_2D'].iloc[idx_bar - 1] >= target_lb) and (sub_df['CRSI_2D'].iloc[idx_bar - 1] <= target_hb)
+                                curr_sig = (b_crsi_2d >= target_lb) and (b_crsi_2d <= target_hb)
+                                
+                                if entry_timing == "Next Open" and prev_sig:
+                                    in_trade = True
+                                    entry_price = b_open
+                                    entry_date = bar_date
+                                elif entry_timing == "Signal Day Close" and curr_sig:
+                                    in_trade = True
+                                    entry_price = b_close
+                                    entry_date = bar_date
+                        
+                        # Latest bar analysis (Today)
+                        latest = calc_df.iloc[-1]
+                        latest_date = calc_df.index[-1]
+                        curr_close = latest['Close']
+                        curr_high = latest['High']
+                        curr_crsi_2d = latest['CRSI_2D']
+                        curr_crsi = latest['CRSI']
+                        x_high_val = latest['X_Day_High']
+                        
+                        # Identify current 2-day CRSI bucket
+                        current_bucket = "None"
+                        for b_name, (b_min, b_max) in BUCKET_RANGES.items():
+                            if b_min <= curr_crsi_2d <= b_max:
+                                current_bucket = b_name
+                                break
+                                
+                        status = "⚪ NEUTRAL"
+                        action_needed = "No Action"
+                        gain_pct = 0.0
+                        days_held = 0
+                        
+                        # Evaluate latest bar against active position
+                        if in_trade:
+                            days_held = (latest_date - entry_date).days
+                            gain_pct = ((curr_close / entry_price) - 1) * 100.0
+                            
+                            hit_c = curr_crsi_2d > crsi_exit_thresh
+                            hit_xh = pd.notna(x_high_val) and (curr_high >= x_high_val)
+                            
+                            exit_triggered = False
+                            reason = []
+                            if hit_xh:
+                                reason.append("Hit X-Day High")
+                            if hit_c:
+                                reason.append(f"CRSI 2D > {crsi_exit_thresh}")
+                                
+                            if exit_mode == "Either (Whichever occurs first)" and (hit_c or hit_xh):
+                                exit_triggered = True
+                            elif exit_mode == "Both Required" and (hit_c and hit_xh):
+                                exit_triggered = True
+                            elif exit_mode == "X-Day High Only" and hit_xh:
+                                exit_triggered = True
+                            elif exit_mode == "2-Day CRSI Threshold Only" and hit_c:
+                                exit_triggered = True
+                                
+                            if exit_triggered:
+                                status = "🚨 EXIT TOMORROW"
+                                action_needed = f"Close at Open ({' & '.join(reason)})"
+                            else:
+                                status = "🟡 OPEN / HOLDING"
+                                action_needed = f"Hold (Entry: ${entry_price:.2f})"
+                        else:
+                            # Check if today triggers an entry signal
+                            is_signal = (target_lb <= curr_crsi_2d <= target_hb)
+                            if is_signal:
+                                status = "🟢 BUY SIGNAL"
+                                action_needed = f"Buy Tomorrow ({entry_timing})"
+                                
+                        results.append({
+                            "Ticker": t,
+                            "Status": status,
+                            "Action / Details": action_needed,
+                            "2-Day CRSI": round(curr_crsi_2d, 2),
+                            "Current Bucket": current_bucket,
+                            "1-Day CRSI": round(curr_crsi, 2),
+                            "Last Close": round(curr_close, 2),
+                            "X-Day High": round(x_high_val, 2) if pd.notna(x_high_val) else np.nan,
+                            "Unrealized PnL %": round(gain_pct, 2) if in_trade else np.nan,
+                            "Days Held": days_held
