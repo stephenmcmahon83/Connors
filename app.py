@@ -87,7 +87,7 @@ def load_vix_data(start_date: datetime) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-def compute_vix_blocked_dates(vix_df: pd.DataFrame, mode: str, lookback: int = 20, crisis_cap: float = 35.0) -> set:
+def compute_vix_blocked_dates(vix_df: pd.DataFrame, mode: str, lookback: int = 20, crisis_cap: float = 40.0) -> set:
     """Returns a set of dates where new entries are strictly BLOCKED by the VIX filter."""
     if vix_df.empty:
         return set()
@@ -97,14 +97,14 @@ def compute_vix_blocked_dates(vix_df: pd.DataFrame, mode: str, lookback: int = 2
     vix_high_n = vix_close.rolling(lookback).max()
     vix_sma_n = vix_close.rolling(lookback).mean()
     
-    if mode == "New 20-Day High Close":
-        blocked_mask = vix_close >= vix_high_n
-    elif mode == "VIX Stretch / Spike (VIX > 1.15x 20d SMA)":
-        blocked_mask = (vix_close / vix_sma_n) >= 1.15
-    elif mode == "Crisis Cap Only (VIX > Cap)":
+    if mode == "Crisis Cap Only (VIX > Cap)":
         blocked_mask = vix_close >= crisis_cap
+    elif mode == "New 20-Day High Close":
+        blocked_mask = vix_close >= vix_high_n
     elif mode == "Dual: New 20d High OR Crisis Cap":
         blocked_mask = (vix_close >= vix_high_n) | (vix_close >= crisis_cap)
+    elif mode == "VIX Stretch / Spike (VIX > 1.15x 20d SMA)":
+        blocked_mask = (vix_close / vix_sma_n) >= 1.15
     else:
         blocked_mask = pd.Series(False, index=vix.index)
         
@@ -373,7 +373,7 @@ def get_nasdaq100_tickers() -> list:
         return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "COST", "AVGO", "TSLA", "AMD"]
 
 # ==========================================
-# 6. UNIVERSE ENGINE WITH VIX FILTER & COMMISSIONS
+# 6. UNIVERSE ENGINE WITH MAX BARS STOP & VIX FILTER
 # ==========================================
 
 def run_universe_backtest(
@@ -388,7 +388,8 @@ def run_universe_backtest(
     initial_capital: float,
     max_positions: int,
     commission_per_trade: float,
-    vix_blocked_dates: set = None
+    vix_blocked_dates: set = None,
+    max_bars_stop: int = 0
 ):
     all_dates = sorted(list(set().union(*[df.index.tolist() for df in data_dict.values()])))
     if len(all_dates) < 120:
@@ -423,6 +424,10 @@ def run_universe_backtest(
             if pd.isna(c_close) or pd.isna(c_open) or pd.isna(c_crsi_2d):
                 continue
             
+            # Increment bars held
+            pos['bars_held'] = pos.get('bars_held', 0) + 1
+            
+            # Check Primary Indicator Exits
             hit_crsi = c_crsi_2d > crsi_exit_thresh
             hit_x_high = pd.notna(x_high) and (c_high >= x_high)
             
@@ -437,7 +442,7 @@ def run_universe_backtest(
                     should_exit = True
                 elif hit_x_high:
                     exit_price = max(c_open, x_high)
-                    exit_reason = "X-Day High"
+                    exit_reason = f"{x_days}-Day High"
                     should_exit = True
                 elif hit_crsi:
                     exit_price = c_close
@@ -450,12 +455,18 @@ def run_universe_backtest(
                     should_exit = True
             elif exit_mode == "X-Day High Only" and hit_x_high:
                 exit_price = max(c_open, x_high)
-                exit_reason = "X-Day High"
+                exit_reason = f"{x_days}-Day High"
                 should_exit = True
             elif exit_mode == "2-Day CRSI Threshold Only" and hit_crsi:
                 exit_price = c_close
                 exit_reason = f"CRSI 2D > {crsi_exit_thresh}"
                 should_exit = True
+                
+            # Check Max Time Stop (Exit after X bars if neither primary exit triggered)
+            if not should_exit and (max_bars_stop > 0) and (pos['bars_held'] >= max_bars_stop):
+                should_exit = True
+                exit_price = c_close
+                exit_reason = f"Time Stop ({max_bars_stop} Bars)"
                 
             if should_exit and pd.notna(exit_price) and exit_price > 0:
                 gross_proceeds = pos['shares'] * exit_price
@@ -475,6 +486,7 @@ def run_universe_backtest(
                     'Exit Reason': exit_reason,
                     'Shares': pos['shares'],
                     'Hold Days': (curr_date - pos['entry_date']).days,
+                    'Hold Bars': pos['bars_held'],
                     'Commissions ($)': round(total_commissions, 2),
                     'Net Return %': round(net_ret_pct, 2),
                     'Net PnL ($)': round(net_pnl, 2)
@@ -486,11 +498,7 @@ def run_universe_backtest(
             
         # 2. PROCESS ENTRIES (WITH VIX REGIME CHECK)
         available_slots = max_positions - len(active_positions)
-        
-        # Check date when the setup signal and VIX filter are evaluated
         setup_eval_date = prev_date if entry_timing == "Next Open" else curr_date
-        
-        # VIX FILTER: If setup date printed a blocked VIX reading, skip ALL new entries
         vix_is_blocking = setup_eval_date in vix_blocked
         
         if available_slots > 0 and selected_buckets and not vix_is_blocking:
@@ -562,7 +570,8 @@ def run_universe_backtest(
                             'entry_date': curr_date,
                             'shares': shares,
                             'gross_cost': gross_cost,
-                            'entry_commission': commission_per_trade
+                            'entry_commission': commission_per_trade,
+                            'bars_held': 0
                         }
         
         # 3. DAILY PORTFOLIO TRACKING
@@ -669,23 +678,23 @@ st.sidebar.subheader("🛡️ Market Regime / VIX Risk Filter")
 use_vix_filter = st.sidebar.checkbox(
     "Enable VIX Volatility Shock Filter",
     value=True,
-    help="Blocks all new trade entries when market volatility is spiking to prevent buying falling knives."
+    help="Blocks all new trade entries when market volatility exceeds threshold to prevent buying falling knives."
 )
 
 vix_mode = st.sidebar.selectbox(
     "VIX Filter Mechanism",
     options=[
-        "New 20-Day High Close",
+        "Crisis Cap Only (VIX > Cap)",
         "Dual: New 20d High OR Crisis Cap",
-        "VIX Stretch / Spike (VIX > 1.15x 20d SMA)",
-        "Crisis Cap Only (VIX > Cap)"
+        "New 20-Day High Close",
+        "VIX Stretch / Spike (VIX > 1.15x 20d SMA)"
     ],
-    index=1,
+    index=0,
     disabled=not use_vix_filter
 )
 
+vix_crisis_cap = st.sidebar.number_input("VIX Crisis Ceiling Cap", min_value=25.0, max_value=60.0, value=40.0, step=5.0, disabled=not use_vix_filter)
 vix_lookback = st.sidebar.slider("VIX High Lookback (Days)", min_value=5, max_value=50, value=20, step=5, disabled=not use_vix_filter)
-vix_crisis_cap = st.sidebar.number_input("VIX Crisis Ceiling Cap", min_value=25.0, max_value=60.0, value=35.0, step=5.0, disabled=not use_vix_filter)
 
 # ---------------- MOMENTUM FILTER ----------------
 st.sidebar.markdown("---")
@@ -706,12 +715,30 @@ falling_type = st.sidebar.radio(
 # ---------------- EXIT RULES ----------------
 st.sidebar.markdown("---")
 st.sidebar.subheader("Exit Rules")
-x_days = st.sidebar.slider("Exit: Prior X-Day High Lookback", min_value=1, max_value=20, value=5, step=1)
-crsi_exit_thresh = st.sidebar.selectbox("Exit: 2-Day CRSI Threshold (> N)", [0, 10, 20, 30, 40, 50, 60, 70, 80, 90], index=7)
+x_days = st.sidebar.slider("Exit: Prior X-Day High Lookback", min_value=1, max_value=20, value=3, step=1)
+crsi_exit_thresh = st.sidebar.selectbox("Exit: 2-Day CRSI Threshold (> N)", [0, 10, 20, 30, 40, 50, 60, 70, 80, 90], index=2)
 exit_mode = st.sidebar.selectbox(
     "Exit Condition Logic",
     ["Either (Whichever occurs first)", "X-Day High Only", "2-Day CRSI Threshold Only", "Both Required"]
 )
+
+# NEW: MAX TIME STOP RULE
+use_time_stop = st.sidebar.checkbox(
+    "Enable Max Time Stop (Exit after X bars)",
+    value=True,
+    help="Emergency exit: forces a market close liquidation if held for X bars and neither primary exit has triggered."
+)
+max_bars_stop = st.sidebar.slider(
+    "Max Holding Period (Bars / Days)",
+    min_value=1,
+    max_value=30,
+    value=5,
+    step=1,
+    disabled=not use_time_stop,
+    help="Maximum number of bars to stay in a trade before exiting."
+)
+effective_max_bars = max_bars_stop if use_time_stop else 0
+
 entry_timing = st.sidebar.radio("Entry Execution", ["Next Open", "Signal Day Close"], horizontal=True)
 
 # ---------------- COMMISSIONS ----------------
@@ -771,7 +798,6 @@ with tab_chart:
         else:
             calc_chart = prepare_crsi_data(raw_chart, x_days=x_days)
             
-            # Fetch VIX data if filter enabled
             vix_blocked = set()
             if use_vix_filter:
                 vix_df = load_vix_data(start_fetch)
@@ -790,7 +816,8 @@ with tab_chart:
                 initial_capital=10000.0,
                 max_positions=1,
                 commission_per_trade=comm_per_order,
-                vix_blocked_dates=vix_blocked
+                vix_blocked_dates=vix_blocked,
+                max_bars_stop=effective_max_bars
             )
             
             cutoff = datetime.today() - timedelta(days=lookback_days)
@@ -825,6 +852,7 @@ with tab_universe:
     st.subheader("20-Year Multi-Asset Portfolio Backtest")
     st.caption(
         f"Simulating trades across selected buckets: **{', '.join(selected_buckets) if selected_buckets else 'None'}** "
+        f"| Time Stop: **{f'{effective_max_bars} Bars' if use_time_stop else 'Disabled'}** "
         f"| VIX Filter: **{'Active (' + vix_mode + ')' if use_vix_filter else 'Disabled'}** "
         f"| Commission: **${comm_per_order:.2f} per order**"
     )
@@ -873,13 +901,12 @@ with tab_universe:
 
         start_dt = datetime(start_year, 1, 1)
         
-        # Load VIX data if enabled
         vix_blocked = set()
         if use_vix_filter:
             with st.spinner("Downloading VIX volatility regime data..."):
                 vix_df = load_vix_data(start_dt)
                 vix_blocked = compute_vix_blocked_dates(vix_df, mode=vix_mode, lookback=vix_lookback, crisis_cap=vix_crisis_cap)
-                st.write(f"🛡️ VIX filter identified **{len(vix_blocked):,} trading sessions** where entries were blocked to prevent drawdowns.")
+                st.write(f"🛡️ VIX filter identified **{len(vix_blocked):,} trading sessions** where entries were blocked.")
 
         st.info(f"Downloading historical data since {start_year} for all {len(ticker_list)} symbols...")
         
@@ -926,7 +953,7 @@ with tab_universe:
         if not data_dict:
             st.error("No valid historical price data retrieved.")
         else:
-            with st.spinner("Simulating multi-asset portfolio with VIX filter and commissions..."):
+            with st.spinner("Simulating multi-asset portfolio..."):
                 trades_df, equity_df = run_universe_backtest(
                     data_dict=data_dict,
                     selected_buckets=selected_buckets,
@@ -939,7 +966,8 @@ with tab_universe:
                     initial_capital=initial_cap,
                     max_positions=max_positions,
                     commission_per_trade=comm_per_order,
-                    vix_blocked_dates=vix_blocked
+                    vix_blocked_dates=vix_blocked,
+                    max_bars_stop=effective_max_bars
                 )
                 
             if trades_df.empty:
@@ -960,6 +988,7 @@ with tab_universe:
                 pf = (gp / gl) if gl > 0 else np.nan
                 
                 total_commissions_paid = trades_df['Commissions ($)'].sum()
+                time_stopped_trades = len(trades_df[trades_df['Exit Reason'].str.contains('Time Stop', na=False)])
                 
                 roll_max = equity_df['Equity'].cummax()
                 drawdown = (equity_df['Equity'] - roll_max) / roll_max
@@ -972,7 +1001,7 @@ with tab_universe:
                 m4.metric("CAGR", f"{cagr:.1f}%")
                 m5.metric("Profit Factor", f"{pf:.2f}" if not np.isnan(pf) else "N/A")
                 m6.metric("Max Drawdown", f"{max_dd:.1f}%")
-                m7.metric("Commissions Paid", f"${total_commissions_paid:,.2f}")
+                m7.metric("Time Stops Triggered", time_stopped_trades)
                 
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
@@ -983,7 +1012,7 @@ with tab_universe:
                     name='Net Portfolio Equity'
                 ))
                 fig.update_layout(
-                    title=f"Net Portfolio Equity Curve ({start_year} – Present | VIX Filter: {vix_mode if use_vix_filter else 'Off'})",
+                    title=f"Net Portfolio Equity Curve ({start_year} – Present | Time Stop: {effective_max_bars} Bars)",
                     xaxis_title="Date",
                     yaxis_title="Total Equity ($)",
                     template="plotly_white",
@@ -1032,14 +1061,14 @@ with tab_universe:
                     Win_Rate=('Net PnL ($)', lambda s: (s > 0).mean() * 100),
                     Net_PnL=('Net PnL ($)', 'sum'),
                     Avg_Return=('Net Return %', 'mean'),
-                    Commissions=('Commissions ($)', 'sum')
+                    Avg_Bars_Held=('Hold Bars', 'mean')
                 ).reset_index().sort_values(by='Net_PnL', ascending=False)
                 
                 st.dataframe(ticker_perf.style.format({
                     "Win_Rate": "{:.1f}%",
                     "Net_PnL": "${:,.2f}",
                     "Avg_Return": "{:.2f}%",
-                    "Commissions": "${:,.2f}"
+                    "Avg_Bars_Held": "{:.1f}"
                 }), use_container_width=True)
                 
                 st.subheader("Executed Trade Log")
@@ -1086,7 +1115,8 @@ with tab_single:
                     initial_capital=10000.0,
                     max_positions=1,
                     commission_per_trade=comm_per_order,
-                    vix_blocked_dates=vix_blocked
+                    vix_blocked_dates=vix_blocked,
+                    max_bars_stop=effective_max_bars
                 )
                 
                 st.markdown("#### 🔍 Price Action & System Trades (Last 1 Year)")
@@ -1127,12 +1157,11 @@ with tab_single:
                     st.dataframe(t_single, use_container_width=True)
 
 # ------------------------------------------
-# TAB 4: LIVE MARKET SCREENER (WITH VIX REGIME BANNER)
+# TAB 4: LIVE MARKET SCREENER
 # ------------------------------------------
 with tab_screener:
     st.subheader("Market Screener: Full Universes")
     
-    # Check Current Live VIX Status
     live_vix = load_vix_data(datetime.today() - timedelta(days=90))
     vix_is_currently_blocking = False
     
@@ -1141,32 +1170,31 @@ with tab_screener:
         v_high_n = live_vix['Close'].rolling(vix_lookback).max().iloc[-1]
         v_sma_n = live_vix['Close'].rolling(vix_lookback).mean().iloc[-1]
         
-        # Test current condition
-        if vix_mode == "New 20-Day High Close":
-            vix_is_currently_blocking = v_latest_close >= v_high_n
-        elif vix_mode == "VIX Stretch / Spike (VIX > 1.15x 20d SMA)":
-            vix_is_currently_blocking = (v_latest_close / v_sma_n) >= 1.15
-        elif vix_mode == "Crisis Cap Only (VIX > Cap)":
+        if vix_mode == "Crisis Cap Only (VIX > Cap)":
             vix_is_currently_blocking = v_latest_close >= vix_crisis_cap
+        elif vix_mode == "New 20-Day High Close":
+            vix_is_currently_blocking = v_latest_close >= v_high_n
         elif vix_mode == "Dual: New 20d High OR Crisis Cap":
             vix_is_currently_blocking = (v_latest_close >= v_high_n) or (v_latest_close >= vix_crisis_cap)
+        elif vix_mode == "VIX Stretch / Spike (VIX > 1.15x 20d SMA)":
+            vix_is_currently_blocking = (v_latest_close / v_sma_n) >= 1.15
             
         if vix_is_currently_blocking:
             st.error(
                 f"🚨 **VIX RISK FILTER ACTIVE — NEW ENTRIES BLOCKED FOR TOMORROW**\n\n"
-                f"Latest VIX Close: **{v_latest_close:.2f}** (Prior {vix_lookback}-Day High: **{v_high_n:.2f}**). "
-                f"Market volatility regime exceeds threshold. System prohibits initiating new mean-reversion long positions."
+                f"Latest VIX Close: **{v_latest_close:.2f}** (Threshold: **{vix_crisis_cap:.1f}**). "
+                f"System prohibits initiating new mean-reversion long positions."
             )
         else:
             st.success(
                 f"🟢 **VIX REGIME NORMAL — ENTRIES PERMITTED**\n\n"
-                f"Latest VIX Close: **{v_latest_close:.2f}** | Prior {vix_lookback}-Day High: **{v_high_n:.2f}** | 20-Day SMA: **{v_sma_n:.2f}**. "
-                f"Volatility is stabilizing or declining."
+                f"Latest VIX Close: **{v_latest_close:.2f}** | Ceiling Cap: **{vix_crisis_cap:.1f}**. "
+                f"Market conditions satisfy volatility safety rules."
             )
     
     st.caption(
         f"Scanning for entry in buckets: **{', '.join(selected_buckets) if selected_buckets else 'None Selected'}** "
-        f"| Falling RSI Filter: **{require_falling_rsi}** ({falling_type if require_falling_rsi else 'Off'})"
+        f"| Time Stop: **{f'{effective_max_bars} Bars' if use_time_stop else 'Off'}**"
     )
     
     screen_univs = st.multiselect(
@@ -1232,6 +1260,49 @@ with tab_screener:
                             continue
                             
                         df_calc = prepare_crsi_data(df_t, x_days=x_days)
+                        
+                        # Simulate past 40 sessions to evaluate active trade state
+                        sub_df = df_calc.iloc[-40:].copy()
+                        in_trade = False
+                        bars_held_sim = 0
+                        
+                        for idx_bar in range(1, len(sub_df) - 1):
+                            b_close = sub_df['Close'].iloc[idx_bar]
+                            b_high = sub_df['High'].iloc[idx_bar]
+                            b_crsi_2d = sub_df['CRSI_2D'].iloc[idx_bar]
+                            b_x_high = sub_df['X_Day_High'].iloc[idx_bar]
+                            
+                            if in_trade:
+                                bars_held_sim += 1
+                                hit_c = b_crsi_2d > crsi_exit_thresh
+                                hit_xh = pd.notna(b_x_high) and (b_high >= b_x_high)
+                                exit_now = False
+                                
+                                if exit_mode == "Either (Whichever occurs first)" and (hit_c or hit_xh):
+                                    exit_now = True
+                                elif exit_mode == "Both Required" and (hit_c and hit_xh):
+                                    exit_now = True
+                                elif exit_mode == "X-Day High Only" and hit_xh:
+                                    exit_now = True
+                                elif exit_mode == "2-Day CRSI Threshold Only" and hit_c:
+                                    exit_now = True
+                                    
+                                if not exit_now and (effective_max_bars > 0) and (bars_held_sim >= effective_max_bars):
+                                    exit_now = True
+                                    
+                                if exit_now:
+                                    in_trade = False
+                                    
+                            if not in_trade:
+                                prev_sig = check_value_in_buckets(sub_df['CRSI_2D'].iloc[idx_bar - 1], selected_buckets)
+                                curr_sig = check_value_in_buckets(b_crsi_2d, selected_buckets)
+                                if entry_timing == "Next Open" and prev_sig:
+                                    in_trade = True
+                                    bars_held_sim = 0
+                                elif entry_timing == "Signal Day Close" and curr_sig:
+                                    in_trade = True
+                                    bars_held_sim = 0
+                                    
                         latest = df_calc.iloc[-1]
                         prev = df_calc.iloc[-2]
                         
@@ -1250,14 +1321,22 @@ with tab_screener:
                                 break
                                 
                         status = "⚪ NEUTRAL"
-                        if in_selected_bucket and passes_falling:
+                        if in_trade:
+                            bars_held_sim += 1
+                            hit_c = crsi_2d > crsi_exit_thresh
+                            hit_xh = pd.notna(latest['X_Day_High']) and (latest['High'] >= latest['X_Day_High'])
+                            hit_time = (effective_max_bars > 0) and (bars_held_sim >= effective_max_bars)
+                            
+                            if hit_c or hit_xh or hit_time:
+                                status = "🚨 EXIT MET"
+                            else:
+                                status = "🟡 HOLDING"
+                        elif in_selected_bucket and passes_falling:
                             if vix_is_currently_blocking:
                                 status = "⛔ BLOCKED (VIX Alert)"
                             else:
                                 status = "🟢 BUY SIGNAL"
-                        elif crsi_2d > crsi_exit_thresh or (pd.notna(latest['X_Day_High']) and latest['High'] >= latest['X_Day_High']):
-                            status = "🚨 EXIT MET"
-                            
+                                
                         results.append({
                             "Ticker": t,
                             "Status": status,
