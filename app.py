@@ -921,4 +921,97 @@ with tab_screener:
         st.info(f"Scanning all {len(full_scan_list)} tickers...")
         
         chunk_size = 50
-        num_chunks = int(np.ceil(len(
+        num_chunks = int(np.ceil(len(full_scan_list) / chunk_size))
+        pbar = st.progress(0.0)
+        s_text = st.empty()
+        
+        results = []
+        falling_col = 'CRSI_Falling' if falling_type == "ConnorsRSI (CRSI)" else 'RSI3_Falling'
+        
+        for c in range(num_chunks):
+            chunk = full_scan_list[c * chunk_size : (c + 1) * chunk_size]
+            s_text.text(f"Scanning chunk {c + 1}/{num_chunks} ({len(chunk)} tickers)...")
+            try:
+                b_raw = yf.download(
+                    chunk,
+                    period="1y",
+                    interval="1d",
+                    group_by="ticker",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=True
+                )
+                for t in chunk:
+                    try:
+                        if isinstance(b_raw.columns, pd.MultiIndex):
+                            if t in b_raw.columns.get_level_values(0):
+                                df_t = b_raw[t].dropna(how='all')
+                            else:
+                                continue
+                        else:
+                            df_t = b_raw.dropna(how='all')
+                            
+                        if len(df_t) < 120:
+                            continue
+                            
+                        df_calc = prepare_crsi_data(df_t, x_days=x_days)
+                        latest = df_calc.iloc[-1]
+                        prev = df_calc.iloc[-2]
+                        
+                        crsi_2d = latest['CRSI_2D']
+                        crsi_today = latest['CRSI']
+                        rsi3_today = latest['RSI3']
+                        is_falling = bool(latest[falling_col])
+                        
+                        in_selected_bucket = check_value_in_buckets(crsi_2d, selected_buckets)
+                        passes_falling = (not require_falling_rsi) or is_falling
+                        
+                        current_b_name = "None"
+                        for b_name, (b_min, b_max) in BUCKET_RANGES.items():
+                            if b_min <= crsi_2d <= b_max:
+                                current_b_name = b_name
+                                break
+                                
+                        status = "⚪ NEUTRAL"
+                        if in_selected_bucket and passes_falling:
+                            status = "🟢 BUY SIGNAL"
+                        elif crsi_2d > crsi_exit_thresh or (pd.notna(latest['X_Day_High']) and latest['High'] >= latest['X_Day_High']):
+                            status = "🚨 EXIT MET"
+                            
+                        results.append({
+                            "Ticker": t,
+                            "Status": status,
+                            "2-Day CRSI": round(crsi_2d, 2),
+                            "Current Bucket": current_b_name,
+                            "CRSI Today": round(crsi_today, 2),
+                            "CRSI Prev": round(prev['CRSI'], 2),
+                            "RSI(3) Today": round(rsi3_today, 2),
+                            "Falling?": "✅ Yes" if is_falling else "❌ No",
+                            "Close": round(latest['Close'], 2),
+                            "X-Day High": round(latest['X_Day_High'], 2) if pd.notna(latest['X_Day_High']) else np.nan
+                        })
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            pbar.progress((c + 1) / num_chunks)
+            
+        pbar.empty()
+        s_text.empty()
+        
+        if results:
+            res_df = pd.DataFrame(results).sort_values(by="2-Day CRSI")
+            if only_actionable:
+                res_df = res_df[res_df['Status'] != "⚪ NEUTRAL"]
+                
+            n_buys = len(res_df[res_df['Status'] == "🟢 BUY SIGNAL"])
+            n_exits = len(res_df[res_df['Status'] == "🚨 EXIT MET"])
+            
+            c_res1, c_res2, c_res3 = st.columns(3)
+            c_res1.metric("Total Scanned", len(results))
+            c_res2.metric("Buy Signals (In Selected Buckets)", n_buys)
+            c_res3.metric("Exit Signals", n_exits)
+            
+            st.dataframe(res_df, use_container_width=True, height=600)
+        else:
+            st.warning("No data retrieved.")
