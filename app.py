@@ -716,4 +716,209 @@ with tab_universe:
                 final_eq = equity_df['Equity'].iloc[-1]
                 tot_ret = ((final_eq / initial_cap) - 1) * 100.0
                 years = max((equity_df.index[-1] - equity_df.index[0]).days / 365.25, 1.0)
-                cagr = (((final_eq / initial_cap) ** (1 / years)) - 1
+                cagr = (((final_eq / initial_cap) ** (1 / years)) - 1) * 100.0 if final_eq > 0 else -100.0
+                
+                gp = wins['Net PnL ($)'].sum()
+                gl = abs(losses['Net PnL ($)'].sum())
+                pf = (gp / gl) if gl > 0 else np.nan
+                
+                total_commissions_paid = trades_df['Commissions ($)'].sum()
+                
+                roll_max = equity_df['Equity'].cummax()
+                drawdown = (equity_df['Equity'] - roll_max) / roll_max
+                max_dd = drawdown.min() * 100.0
+                
+                m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+                m1.metric("Total Trades", n_trades)
+                m2.metric("Win Rate", f"{win_rate:.1f}%")
+                m3.metric("Net Total Return", f"{tot_ret:.1f}%")
+                m4.metric("CAGR", f"{cagr:.1f}%")
+                m5.metric("Profit Factor", f"{pf:.2f}" if not np.isnan(pf) else "N/A")
+                m6.metric("Max Drawdown", f"{max_dd:.1f}%")
+                m7.metric("Commissions Paid", f"${total_commissions_paid:,.2f}")
+                
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=equity_df.index,
+                    y=equity_df['Equity'],
+                    mode='lines',
+                    line=dict(color='#00C805', width=2),
+                    name='Net Portfolio Equity'
+                ))
+                fig.update_layout(
+                    title=f"Net Portfolio Equity Curve ({start_year} – Present | After Commissions)",
+                    xaxis_title="Date",
+                    yaxis_title="Total Equity ($)",
+                    template="plotly_white",
+                    height=450
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.markdown("---")
+                st.subheader("📅 Annual Performance Breakdown")
+                
+                annual_df = calculate_annual_metrics(equity_df, trades_df, initial_cap)
+                
+                bar_colors = ['#00C805' if r >= 0 else '#FF3B30' for r in annual_df['Return %']]
+                fig_ann = go.Figure()
+                fig_ann.add_trace(go.Bar(
+                    x=annual_df['Year'].astype(str),
+                    y=annual_df['Return %'],
+                    marker_color=bar_colors,
+                    text=[f"{r:+.1f}%" for r in annual_df['Return %']],
+                    textposition="outside"
+                ))
+                fig_ann.update_layout(
+                    title="Annual Net Return (%) by Calendar Year",
+                    xaxis_title="Year",
+                    yaxis_title="Return (%)",
+                    template="plotly_white",
+                    height=380,
+                    margin=dict(t=40, b=30, l=20, r=20)
+                )
+                st.plotly_chart(fig_ann, use_container_width=True)
+                
+                st.dataframe(
+                    annual_df.style.format({
+                        "Return %": "{:+.2f}%",
+                        "Net PnL ($)": "${:,.2f}",
+                        "Max Drawdown %": "{:.1f}%",
+                        "Ending Equity ($)": "${:,.2f}"
+                    }),
+                    use_container_width=True
+                )
+                
+                st.markdown("---")
+                st.subheader("Performance Breakdown by Ticker")
+                ticker_perf = trades_df.groupby('Ticker').agg(
+                    Trades=('Net PnL ($)', 'count'),
+                    Win_Rate=('Net PnL ($)', lambda s: (s > 0).mean() * 100),
+                    Net_PnL=('Net PnL ($)', 'sum'),
+                    Avg_Return=('Net Return %', 'mean'),
+                    Commissions=('Commissions ($)', 'sum')
+                ).reset_index().sort_values(by='Net_PnL', ascending=False)
+                
+                st.dataframe(ticker_perf.style.format({
+                    "Win_Rate": "{:.1f}%",
+                    "Net_PnL": "${:,.2f}",
+                    "Avg_Return": "{:.2f}%",
+                    "Commissions": "${:,.2f}"
+                }), use_container_width=True)
+                
+                st.subheader("Executed Trade Log")
+                st.dataframe(trades_df, use_container_width=True)
+
+# ------------------------------------------
+# TAB 3: SINGLE TICKER MULTI-BUCKET & MATRIX
+# ------------------------------------------
+with tab_single:
+    st.subheader("Single Ticker: Combined Selected Buckets & Visuals")
+    
+    s_col1, s_col2 = st.columns(2)
+    with s_col1:
+        st_ticker = st.text_input("Symbol", value="SPY", key="st_ticker_input").upper()
+    with s_col2:
+        st_start_year = st.selectbox("Historical Start Year", [2004, 2006, 2010, 2015, 2020], index=1, key="st_yr")
+        
+    if st.button("Run Single Ticker Backtest", type="primary"):
+        with st.spinner(f"Evaluating {st_ticker}..."):
+            raw_s = yf.download(st_ticker, start=datetime(st_start_year, 1, 1), progress=False, auto_adjust=True)
+            if isinstance(raw_s.columns, pd.MultiIndex):
+                raw_s.columns = raw_s.columns.get_level_values(0)
+                
+            if len(raw_s) >= 120:
+                df_prep = prepare_crsi_data(raw_s, x_days=x_days)
+                falling_col = 'CRSI_Falling' if falling_type == "ConnorsRSI (CRSI)" else 'RSI3_Falling'
+                
+                s_dict = {st_ticker: df_prep}
+                t_single, eq_single = run_universe_backtest(
+                    data_dict=s_dict,
+                    selected_buckets=selected_buckets,
+                    exit_mode=exit_mode,
+                    x_days=x_days,
+                    crsi_exit_thresh=crsi_exit_thresh,
+                    require_falling=require_falling_rsi,
+                    falling_type=falling_type,
+                    entry_timing=entry_timing,
+                    initial_capital=10000.0,
+                    max_positions=1,
+                    commission_per_trade=comm_per_order
+                )
+                
+                st.markdown("#### 🔍 Price Action & 2-Day CRSI Indicator")
+                recent_subset = df_prep.iloc[-252:].copy() if len(df_prep) >= 252 else df_prep.copy()
+                fig_candlestick_single = create_candlestick_crsi_chart(recent_subset, st_ticker, x_days=x_days)
+                st.plotly_chart(fig_candlestick_single, use_container_width=True)
+                
+                if t_single.empty:
+                    st.warning("No trades triggered for the selected bucket(s) on this ticker.")
+                else:
+                    n_s = len(t_single)
+                    wr_s = (len(t_single[t_single['Net PnL ($)'] > 0]) / n_s) * 100
+                    tot_ret_s = ((eq_single['Equity'].iloc[-1] / 10000.0) - 1) * 100
+                    
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Total Trades", n_s)
+                    c2.metric("Win Rate", f"{wr_s:.1f}%")
+                    c3.metric("Net Total Return", f"{tot_ret_s:.1f}%")
+                    c4.metric("Total Net PnL", f"${t_single['Net PnL ($)'].sum():,.2f}")
+                    
+                    fig_s = go.Figure()
+                    fig_s.add_trace(go.Scatter(x=eq_single.index, y=eq_single['Equity'], mode='lines', line=dict(color='#2962FF', width=2)))
+                    fig_s.update_layout(title=f"{st_ticker} Net Equity Curve (After Commissions)", template="plotly_white", height=380)
+                    st.plotly_chart(fig_s, use_container_width=True)
+                    
+                    st.markdown("#### Annual Performance Breakdown")
+                    st.dataframe(
+                        calculate_annual_metrics(eq_single, t_single, 10000.0).style.format({
+                            "Return %": "{:+.2f}%",
+                            "Net PnL ($)": "${:,.2f}",
+                            "Max Drawdown %": "{:.1f}%",
+                            "Ending Equity ($)": "${:,.2f}"
+                        }),
+                        use_container_width=True
+                    )
+                    
+                    st.markdown("#### Trade Log")
+                    st.dataframe(t_single, use_container_width=True)
+
+# ------------------------------------------
+# TAB 4: LIVE MARKET SCREENER
+# ------------------------------------------
+with tab_screener:
+    st.subheader("Market Screener: Full Universes")
+    st.caption(
+        f"Scanning for entry in buckets: **{', '.join(selected_buckets) if selected_buckets else 'None Selected'}** "
+        f"| Falling RSI Filter: **{require_falling_rsi}** ({falling_type if require_falling_rsi else 'Off'})"
+    )
+    
+    screen_univs = st.multiselect(
+        "Select Universes to Scan Completely:",
+        ["Full S&P 500", "Full Nasdaq 100", "Major US ETFs", "Russell Representative", "Top Global ADRs"],
+        default=["Full Nasdaq 100", "Major US ETFs"]
+    )
+    
+    only_actionable = st.checkbox("Show Only Buy Signals & Exits", value=False)
+    
+    if st.button("🚀 Run Live Screener Across All Tickers", type="primary"):
+        if not selected_buckets:
+            st.error("Please select at least one ConnorsRSI bucket in the sidebar.")
+            st.stop()
+            
+        full_scan_list = []
+        if "Full S&P 500" in screen_univs:
+            full_scan_list.extend(get_sp500_tickers())
+        if "Full Nasdaq 100" in screen_univs:
+            full_scan_list.extend(get_nasdaq100_tickers())
+        if "Major US ETFs" in screen_univs:
+            full_scan_list.extend(MAJOR_ETFS)
+        if "Russell Representative" in screen_univs:
+            full_scan_list.extend(RUSSELL_REPRESENTATIVE)
+        if "Top Global ADRs" in screen_univs:
+            full_scan_list.extend(TOP_ADRS)
+            
+        full_scan_list = sorted(list(set(full_scan_list)))
+        st.info(f"Scanning all {len(full_scan_list)} tickers...")
+        
+        chunk_size = 50
+        num_chunks = int(np.ceil(len(
