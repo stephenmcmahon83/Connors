@@ -710,4 +710,676 @@ rank_method = st.sidebar.radio(
     help="Determines which stocks get priority when more setups trigger than available portfolio slots."
 )
 
-# ---------------- V
+# ---------------- VIX RISK FILTER ----------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("🛡️ Market Regime / VIX Risk Filter")
+use_vix_filter = st.sidebar.checkbox(
+    "Enable VIX Volatility Shock Filter",
+    value=True,
+    help="Blocks all new trade entries when market volatility exceeds threshold."
+)
+
+vix_mode = st.sidebar.selectbox(
+    "VIX Filter Mechanism",
+    options=[
+        "Crisis Cap Only (VIX > Cap)",
+        "Dual: New 20d High OR Crisis Cap",
+        "New 20-Day High Close",
+        "VIX Stretch / Spike (VIX > 1.15x 20d SMA)"
+    ],
+    index=0,
+    disabled=not use_vix_filter
+)
+
+vix_crisis_cap = st.sidebar.number_input("VIX Crisis Ceiling Cap", min_value=25.0, max_value=60.0, value=40.0, step=5.0, disabled=not use_vix_filter)
+vix_lookback = st.sidebar.slider("VIX High Lookback (Days)", min_value=5, max_value=50, value=20, step=5, disabled=not use_vix_filter)
+
+# ---------------- MOMENTUM FILTER ----------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("Momentum / Declining Filter")
+require_falling_rsi = st.sidebar.checkbox(
+    "Require Latest RSI < Prior Day RSI",
+    value=False
+)
+
+falling_type = st.sidebar.radio(
+    "RSI Metric for Falling Filter",
+    ["ConnorsRSI (CRSI)", "Price RSI (RSI-3)"],
+    index=0,
+    disabled=not require_falling_rsi
+)
+
+# ---------------- EXIT RULES ----------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("Exit Rules")
+x_days = st.sidebar.slider("Exit: Prior X-Day High Lookback", min_value=1, max_value=20, value=3, step=1)
+crsi_exit_thresh = st.sidebar.selectbox("Exit: 2-Day CRSI Threshold (> N)", [0, 10, 20, 30, 40, 50, 60, 70, 80, 90], index=3)
+exit_mode = st.sidebar.selectbox(
+    "Exit Condition Logic",
+    ["Either (Whichever occurs first)", "X-Day High Only", "2-Day CRSI Threshold Only", "Both Required"]
+)
+
+use_time_stop = st.sidebar.checkbox(
+    "Enable Max Time Stop (Exit after X bars)",
+    value=True
+)
+max_bars_stop = st.sidebar.slider(
+    "Max Holding Period (Bars / Days)",
+    min_value=1,
+    max_value=30,
+    value=3,
+    step=1,
+    disabled=not use_time_stop
+)
+effective_max_bars = max_bars_stop if use_time_stop else 0
+
+entry_timing = st.sidebar.radio("Entry Execution", ["Next Open", "Signal Day Close"], horizontal=True)
+
+# ---------------- COMMISSIONS ----------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("Execution Friction")
+comm_per_order = st.sidebar.number_input(
+    "Commission per Order / Trade ($)",
+    min_value=0.0,
+    max_value=25.0,
+    value=2.00,
+    step=0.50
+)
+
+# ==========================================
+# 9. TABS
+# ==========================================
+
+tab_chart, tab_universe, tab_single, tab_screener = st.tabs([
+    "🕯️ Candlestick & CRSI Chart",
+    "🌐 20-Year Universe Backtester",
+    "📊 Single Ticker Multi-Bucket & Matrix",
+    "🔍 Live Market Screener"
+])
+
+# ------------------------------------------
+# TAB 1: INTERACTIVE CANDLESTICK & CRSI CHART
+# ------------------------------------------
+with tab_chart:
+    st.subheader("Candlestick Chart with System Entry & Exit Ticks")
+    st.caption(
+        "Green triangles indicate profitable trades; Red triangles indicate unprofitable trades. "
+        "Dotted lines connect entries to exits."
+    )
+    
+    c_col1, c_col2 = st.columns([1, 2])
+    with c_col1:
+        chart_ticker = st.text_input("Enter Stock Ticker Symbol", value="SOXL", key="standalone_chart_ticker").upper()
+    with c_col2:
+        time_period = st.selectbox(
+            "Select Chart Timeframe Lookback",
+            ["3 Months", "6 Months", "1 Year", "2 Years", "5 Years"],
+            index=2
+        )
+        
+    days_map = {"3 Months": 90, "6 Months": 180, "1 Year": 365, "2 Years": 730, "5 Years": 1825}
+    lookback_days = days_map[time_period]
+    start_fetch = datetime.today() - timedelta(days=lookback_days + 200)
+    
+    with st.spinner(f"Simulating trades and generating chart for {chart_ticker}..."):
+        raw_chart = yf.download(chart_ticker, start=start_fetch, interval="1d", progress=False, auto_adjust=True)
+        if isinstance(raw_chart.columns, pd.MultiIndex):
+            raw_chart.columns = raw_chart.columns.get_level_values(0)
+            
+        if len(raw_chart) < 120:
+            st.error("Insufficient market data for this ticker/period combination.")
+        else:
+            calc_chart = prepare_crsi_data(raw_chart, x_days=x_days)
+            
+            vix_blocked = set()
+            if use_vix_filter:
+                vix_df = load_vix_data(start_fetch)
+                vix_blocked = compute_vix_blocked_dates(vix_df, mode=vix_mode, lookback=vix_lookback, crisis_cap=vix_crisis_cap)
+            
+            s_dict = {chart_ticker: calc_chart}
+            trades_chart, _ = run_universe_backtest(
+                data_dict=s_dict,
+                selected_buckets=selected_buckets,
+                exit_mode=exit_mode,
+                x_days=x_days,
+                crsi_exit_thresh=crsi_exit_thresh,
+                require_falling=require_falling_rsi,
+                falling_type=falling_type,
+                entry_timing=entry_timing,
+                initial_capital=10000.0,
+                max_positions=1,
+                commission_per_trade=comm_per_order,
+                vix_blocked_dates=vix_blocked,
+                max_bars_stop=effective_max_bars,
+                rank_method=rank_method
+            )
+            
+            cutoff = datetime.today() - timedelta(days=lookback_days)
+            cutoff_ts = pd.to_datetime(cutoff)
+            display_chart = calc_chart[calc_chart.index >= cutoff_ts]
+            
+            if display_chart.empty:
+                display_chart = calc_chart.iloc[-60:]
+                
+            latest_bar = display_chart.iloc[-1]
+            
+            sm1, sm2, sm3, sm4, sm5 = st.columns(5)
+            sm1.metric("Latest Close", f"${latest_bar['Close']:.2f}")
+            sm2.metric("2-Day CRSI", f"{latest_bar['CRSI_2D']:.2f}")
+            sm3.metric("14-Day ATR (%)", f"{latest_bar['ATR_Pct_14']:.2f}%")
+            sm4.metric(f"Prior {x_days}-Day High", f"${latest_bar['X_Day_High']:.2f}" if pd.notna(latest_bar['X_Day_High']) else "N/A")
+            
+            vis_trades = trades_chart[trades_chart['Entry Date'] >= display_chart.index[0]] if not trades_chart.empty else pd.DataFrame()
+            sm5.metric("Visible Trades", len(vis_trades))
+            
+            fig_candlestick = create_candlestick_crsi_chart(display_chart, chart_ticker, x_days=x_days, trades_df=trades_chart)
+            st.plotly_chart(fig_candlestick, use_container_width=True)
+            
+            if not vis_trades.empty:
+                with st.expander(f"View {len(vis_trades)} System Trades Plotted Above"):
+                    st.dataframe(vis_trades, use_container_width=True)
+
+# ------------------------------------------
+# TAB 2: 20-YEAR UNIVERSE PORTFOLIO BACKTEST
+# ------------------------------------------
+with tab_universe:
+    st.subheader("20-Year Multi-Asset Portfolio Backtest")
+    st.caption(
+        f"Buckets: **{', '.join(selected_buckets) if selected_buckets else 'None'}** "
+        f"| Ranking: **{rank_method}** "
+        f"| Time Stop: **{f'{effective_max_bars} Bars' if use_time_stop else 'Disabled'}** "
+        f"| VIX Filter: **{'Active (' + vix_mode + ')' if use_vix_filter else 'Disabled'}**"
+    )
+    
+    u1, u2, u3 = st.columns([2, 1, 1])
+    with u1:
+        univ_choice = st.selectbox(
+            "Select Universe Basket:",
+            [
+                "S&P 500 + Major Liquid ETFs",
+                "Full S&P 500",
+                "Major Liquid ETFs (Complete List)",
+                "Full Nasdaq 100",
+                "Russell Representative & Growth",
+                "Top Global ADRs",
+                "Custom Ticker List"
+            ]
+        )
+    with u2:
+        start_year = st.selectbox("Start Year", options=list(range(2004, 2026)), index=2)
+    with u3:
+        initial_cap = st.number_input("Starting Capital ($)", value=10000.0, step=2500.0)
+
+    p1, p2 = st.columns(2)
+    with p1:
+        max_positions = st.slider("Max Concurrent Open Positions", min_value=1, max_value=30, value=5, step=1)
+    with p2:
+        custom_univ = st.text_input("Custom Ticker Basket (if selected):", value="SPY, QQQ, DIA, IWM, SMH, XLF, XLE, GLD, TLT")
+
+    if st.button("🚀 Run Universe Backtest", type="primary"):
+        if not selected_buckets:
+            st.error("Please select at least one ConnorsRSI bucket in the sidebar.")
+            st.stop()
+            
+        if univ_choice == "S&P 500 + Major Liquid ETFs":
+            ticker_list = sorted(list(set(get_sp500_tickers() + MAJOR_ETFS)))
+        elif univ_choice == "Full S&P 500":
+            ticker_list = get_sp500_tickers()
+        elif univ_choice == "Major Liquid ETFs (Complete List)":
+            ticker_list = MAJOR_ETFS
+        elif univ_choice == "Full Nasdaq 100":
+            ticker_list = get_nasdaq100_tickers()
+        elif univ_choice == "Russell Representative & Growth":
+            ticker_list = RUSSELL_REPRESENTATIVE
+        elif univ_choice == "Top Global ADRs":
+            ticker_list = TOP_ADRS
+        else:
+            ticker_list = [t.strip().upper() for t in custom_univ.split(",") if t.strip()]
+
+        start_dt = datetime(start_year, 1, 1)
+        
+        vix_blocked = set()
+        if use_vix_filter:
+            with st.spinner("Downloading VIX volatility regime data..."):
+                vix_df = load_vix_data(start_dt)
+                vix_blocked = compute_vix_blocked_dates(vix_df, mode=vix_mode, lookback=vix_lookback, crisis_cap=vix_crisis_cap)
+                st.write(f"🛡️ VIX filter identified **{len(vix_blocked):,} trading sessions** where entries were blocked.")
+
+        st.info(f"Downloading historical data since {start_year} for all {len(ticker_list)} symbols...")
+        
+        data_dict = {}
+        chunk_size = 50
+        num_chunks = int(np.ceil(len(ticker_list) / chunk_size))
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+        
+        for c in range(num_chunks):
+            chunk = ticker_list[c * chunk_size : (c + 1) * chunk_size]
+            status_text.text(f"Downloading chunk {c + 1}/{num_chunks} ({len(chunk)} tickers)...")
+            try:
+                b_data = yf.download(
+                    chunk,
+                    start=start_dt,
+                    interval="1d",
+                    group_by="ticker",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=True
+                )
+                for t in chunk:
+                    try:
+                        if isinstance(b_data.columns, pd.MultiIndex):
+                            if t in b_data.columns.get_level_values(0):
+                                df_t = b_data[t].dropna(how='all')
+                            else:
+                                continue
+                        else:
+                            df_t = b_data.dropna(how='all')
+                            
+                        if len(df_t) >= 120:
+                            data_dict[t] = prepare_crsi_data(df_t, x_days=x_days)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            progress_bar.progress((c + 1) / num_chunks)
+            
+        progress_bar.empty()
+        status_text.empty()
+        
+        if not data_dict:
+            st.error("No valid historical price data retrieved.")
+        else:
+            with st.spinner(f"Simulating portfolio (Sorting candidates by {rank_method})..."):
+                trades_df, equity_df = run_universe_backtest(
+                    data_dict=data_dict,
+                    selected_buckets=selected_buckets,
+                    exit_mode=exit_mode,
+                    x_days=x_days,
+                    crsi_exit_thresh=crsi_exit_thresh,
+                    require_falling=require_falling_rsi,
+                    falling_type=falling_type,
+                    entry_timing=entry_timing,
+                    initial_capital=initial_cap,
+                    max_positions=max_positions,
+                    commission_per_trade=comm_per_order,
+                    vix_blocked_dates=vix_blocked,
+                    max_bars_stop=effective_max_bars,
+                    rank_method=rank_method
+                )
+                
+            if trades_df.empty:
+                st.warning("No trades were triggered for the selected bucket(s) during this timeframe.")
+            else:
+                n_trades = len(trades_df)
+                wins = trades_df[trades_df['Net PnL ($)'] > 0]
+                losses = trades_df[trades_df['Net PnL ($)'] < 0]
+                win_rate = (len(wins) / n_trades) * 100.0
+                
+                final_eq = equity_df['Equity'].iloc[-1]
+                tot_ret = ((final_eq / initial_cap) - 1) * 100.0
+                years = max((equity_df.index[-1] - equity_df.index[0]).days / 365.25, 1.0)
+                cagr = (((final_eq / initial_cap) ** (1 / years)) - 1) * 100.0 if final_eq > 0 else -100.0
+                
+                gp = wins['Net PnL ($)'].sum()
+                gl = abs(losses['Net PnL ($)'].sum())
+                pf = (gp / gl) if gl > 0 else np.nan
+                
+                time_stopped_trades = len(trades_df[trades_df['Exit Reason'].str.contains('Time Stop', na=False)])
+                
+                roll_max = equity_df['Equity'].cummax()
+                drawdown = (equity_df['Equity'] - roll_max) / roll_max
+                max_dd = drawdown.min() * 100.0
+                
+                m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+                m1.metric("Total Trades", n_trades)
+                m2.metric("Win Rate", f"{win_rate:.1f}%")
+                m3.metric("Net Total Return", f"{tot_ret:.1f}%")
+                m4.metric("CAGR", f"{cagr:.1f}%")
+                m5.metric("Profit Factor", f"{pf:.2f}" if not np.isnan(pf) else "N/A")
+                m6.metric("Max Drawdown", f"{max_dd:.1f}%")
+                m7.metric("Time Stops", time_stopped_trades)
+                
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=equity_df.index,
+                    y=equity_df['Equity'],
+                    mode='lines',
+                    line=dict(color='#00C805', width=2),
+                    name='Net Portfolio Equity'
+                ))
+                fig.update_layout(
+                    title=f"Net Portfolio Equity Curve ({start_year} – Present | Sorted by: {rank_method})",
+                    xaxis_title="Date",
+                    yaxis_title="Total Equity ($)",
+                    template="plotly_white",
+                    height=450
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                st.markdown("---")
+                st.subheader("📅 Annual Performance Breakdown")
+                
+                annual_df = calculate_annual_metrics(equity_df, trades_df, initial_cap)
+                
+                bar_colors = ['#00C805' if r >= 0 else '#FF3B30' for r in annual_df['Return %']]
+                fig_ann = go.Figure()
+                fig_ann.add_trace(go.Bar(
+                    x=annual_df['Year'].astype(str),
+                    y=annual_df['Return %'],
+                    marker_color=bar_colors,
+                    text=[f"{r:+.1f}%" for r in annual_df['Return %']],
+                    textposition="outside"
+                ))
+                fig_ann.update_layout(
+                    title="Annual Net Return (%) by Calendar Year",
+                    xaxis_title="Year",
+                    yaxis_title="Return (%)",
+                    template="plotly_white",
+                    height=380,
+                    margin=dict(t=40, b=30, l=20, r=20)
+                )
+                st.plotly_chart(fig_ann, use_container_width=True)
+                
+                st.dataframe(
+                    annual_df.style.format({
+                        "Return %": "{:+.2f}%",
+                        "Net PnL ($)": "${:,.2f}",
+                        "Max Drawdown %": "{:.1f}%",
+                        "Ending Equity ($)": "${:,.2f}"
+                    }),
+                    use_container_width=True
+                )
+                
+                st.markdown("---")
+                st.subheader("Executed Trade Log")
+                st.dataframe(trades_df, use_container_width=True)
+
+# ------------------------------------------
+# TAB 3: SINGLE TICKER MULTI-BUCKET & MATRIX
+# ------------------------------------------
+with tab_single:
+    st.subheader("Single Ticker: Combined Selected Buckets & Visuals")
+    
+    s_col1, s_col2 = st.columns(2)
+    with s_col1:
+        st_ticker = st.text_input("Symbol", value="SPY", key="st_ticker_input").upper()
+    with s_col2:
+        st_start_year = st.selectbox("Historical Start Year", [2004, 2006, 2010, 2015, 2020], index=1, key="st_yr")
+        
+    if st.button("Run Single Ticker Backtest", type="primary"):
+        with st.spinner(f"Evaluating {st_ticker}..."):
+            start_single_dt = datetime(st_start_year, 1, 1)
+            raw_s = yf.download(st_ticker, start=start_single_dt, progress=False, auto_adjust=True)
+            if isinstance(raw_s.columns, pd.MultiIndex):
+                raw_s.columns = raw_s.columns.get_level_values(0)
+                
+            if len(raw_s) >= 120:
+                df_prep = prepare_crsi_data(raw_s, x_days=x_days)
+                
+                vix_blocked = set()
+                if use_vix_filter:
+                    vix_df = load_vix_data(start_single_dt)
+                    vix_blocked = compute_vix_blocked_dates(vix_df, mode=vix_mode, lookback=vix_lookback, crisis_cap=vix_crisis_cap)
+                
+                s_dict = {st_ticker: df_prep}
+                t_single, eq_single = run_universe_backtest(
+                    data_dict=s_dict,
+                    selected_buckets=selected_buckets,
+                    exit_mode=exit_mode,
+                    x_days=x_days,
+                    crsi_exit_thresh=crsi_exit_thresh,
+                    require_falling=require_falling_rsi,
+                    falling_type=falling_type,
+                    entry_timing=entry_timing,
+                    initial_capital=10000.0,
+                    max_positions=1,
+                    commission_per_trade=comm_per_order,
+                    vix_blocked_dates=vix_blocked,
+                    max_bars_stop=effective_max_bars,
+                    rank_method=rank_method
+                )
+                
+                st.markdown("#### 🔍 Price Action & System Trades (Last 1 Year)")
+                recent_subset = df_prep.iloc[-252:].copy() if len(df_prep) >= 252 else df_prep.copy()
+                fig_candlestick_single = create_candlestick_crsi_chart(recent_subset, st_ticker, x_days=x_days, trades_df=t_single)
+                st.plotly_chart(fig_candlestick_single, use_container_width=True)
+                
+                if t_single.empty:
+                    st.warning("No trades triggered for the selected bucket(s) on this ticker.")
+                else:
+                    n_s = len(t_single)
+                    wr_s = (len(t_single[t_single['Net PnL ($)'] > 0]) / n_s) * 100
+                    tot_ret_s = ((eq_single['Equity'].iloc[-1] / 10000.0) - 1) * 100
+                    
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Total Trades", n_s)
+                    c2.metric("Win Rate", f"{wr_s:.1f}%")
+                    c3.metric("Net Total Return", f"{tot_ret_s:.1f}%")
+                    c4.metric("Total Net PnL", f"${t_single['Net PnL ($)'].sum():,.2f}")
+                    
+                    st.dataframe(t_single, use_container_width=True)
+
+# ------------------------------------------
+# TAB 4: LIVE MARKET SCREENER
+# ------------------------------------------
+with tab_screener:
+    st.subheader("Market Screener: Full Universes")
+    
+    live_vix = load_vix_data(datetime.today() - timedelta(days=90))
+    vix_is_currently_blocking = False
+    
+    if not live_vix.empty and use_vix_filter:
+        v_latest_close = live_vix['Close'].iloc[-1]
+        v_high_n = live_vix['Close'].rolling(vix_lookback).max().iloc[-1]
+        v_sma_n = live_vix['Close'].rolling(vix_lookback).mean().iloc[-1]
+        
+        if vix_mode == "Crisis Cap Only (VIX > Cap)":
+            vix_is_currently_blocking = v_latest_close >= vix_crisis_cap
+        elif vix_mode == "New 20-Day High Close":
+            vix_is_currently_blocking = v_latest_close >= v_high_n
+        elif vix_mode == "Dual: New 20d High OR Crisis Cap":
+            vix_is_currently_blocking = (v_latest_close >= v_high_n) or (v_latest_close >= vix_crisis_cap)
+        elif vix_mode == "VIX Stretch / Spike (VIX > 1.15x 20d SMA)":
+            vix_is_currently_blocking = (v_latest_close / v_sma_n) >= 1.15
+            
+        if vix_is_currently_blocking:
+            st.error(
+                f"🚨 **VIX RISK FILTER ACTIVE — NEW ENTRIES BLOCKED FOR TOMORROW**\n\n"
+                f"Latest VIX Close: **{v_latest_close:.2f}** (Threshold: **{vix_crisis_cap:.1f}**)."
+            )
+        else:
+            st.success(
+                f"🟢 **VIX REGIME NORMAL — ENTRIES PERMITTED**\n\n"
+                f"Latest VIX Close: **{v_latest_close:.2f}** | Ceiling Cap: **{vix_crisis_cap:.1f}**."
+            )
+    
+    st.caption(
+        f"Scanning Buckets: **{', '.join(selected_buckets) if selected_buckets else 'None'}** "
+        f"| Candidate Sort Priority: **{rank_method}** "
+        f"| Time Stop: **{f'{effective_max_bars} Bars' if use_time_stop else 'Off'}**"
+    )
+    
+    screen_univs = st.multiselect(
+        "Select Universes to Scan Completely:",
+        ["Full S&P 500", "Major US ETFs", "Full Nasdaq 100", "Russell Representative", "Top Global ADRs"],
+        default=["Full S&P 500", "Major US ETFs"]
+    )
+    
+    only_actionable = st.checkbox("Show Only Buy Signals, Holdings & Exits", value=True)
+    
+    if st.button("🚀 Run Live Screener Across All Tickers", type="primary"):
+        if not selected_buckets:
+            st.error("Please select at least one ConnorsRSI bucket in the sidebar.")
+            st.stop()
+            
+        full_scan_list = []
+        if "Full S&P 500" in screen_univs:
+            full_scan_list.extend(get_sp500_tickers())
+        if "Major US ETFs" in screen_univs:
+            full_scan_list.extend(MAJOR_ETFS)
+        if "Full Nasdaq 100" in screen_univs:
+            full_scan_list.extend(get_nasdaq100_tickers())
+        if "Russell Representative" in screen_univs:
+            full_scan_list.extend(RUSSELL_REPRESENTATIVE)
+        if "Top Global ADRs" in screen_univs:
+            full_scan_list.extend(TOP_ADRS)
+            
+        full_scan_list = sorted(list(set(full_scan_list)))
+        st.info(f"Scanning all {len(full_scan_list)} tickers...")
+        
+        chunk_size = 50
+        num_chunks = int(np.ceil(len(full_scan_list) / chunk_size))
+        pbar = st.progress(0.0)
+        s_text = st.empty()
+        
+        results = []
+        falling_col = 'CRSI_Falling' if falling_type == "ConnorsRSI (CRSI)" else 'RSI3_Falling'
+        
+        for c in range(num_chunks):
+            chunk = full_scan_list[c * chunk_size : (c + 1) * chunk_size]
+            s_text.text(f"Scanning chunk {c + 1}/{num_chunks} ({len(chunk)} tickers)...")
+            try:
+                b_raw = yf.download(
+                    chunk,
+                    period="1y",
+                    interval="1d",
+                    group_by="ticker",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=True
+                )
+                for t in chunk:
+                    try:
+                        if isinstance(b_raw.columns, pd.MultiIndex):
+                            if t in b_raw.columns.get_level_values(0):
+                                df_t = b_raw[t].dropna(how='all')
+                            else:
+                                continue
+                        else:
+                            df_t = b_raw.dropna(how='all')
+                            
+                        if len(df_t) < 120:
+                            continue
+                            
+                        df_calc = prepare_crsi_data(df_t, x_days=x_days)
+                        
+                        sub_df = df_calc.iloc[-40:].copy()
+                        in_trade = False
+                        bars_held_sim = 0
+                        
+                        for idx_bar in range(1, len(sub_df) - 1):
+                            b_high = sub_df['High'].iloc[idx_bar]
+                            b_crsi_2d = sub_df['CRSI_2D'].iloc[idx_bar]
+                            b_x_high = sub_df['X_Day_High'].iloc[idx_bar]
+                            
+                            exited_this_bar = False
+                            if in_trade:
+                                bars_held_sim += 1
+                                hit_c = b_crsi_2d > crsi_exit_thresh
+                                hit_xh = pd.notna(b_x_high) and (b_high >= b_x_high)
+                                exit_now = False
+                                
+                                if exit_mode == "Either (Whichever occurs first)" and (hit_c or hit_xh):
+                                    exit_now = True
+                                elif exit_mode == "Both Required" and (hit_c and hit_xh):
+                                    exit_now = True
+                                elif exit_mode == "X-Day High Only" and hit_xh:
+                                    exit_now = True
+                                elif exit_mode == "2-Day CRSI Threshold Only" and hit_c:
+                                    exit_now = True
+                                    
+                                if not exit_now and (effective_max_bars > 0) and (bars_held_sim >= effective_max_bars):
+                                    exit_now = True
+                                    
+                                if exit_now:
+                                    in_trade = False
+                                    exited_this_bar = True
+                                    
+                            if not in_trade and not exited_this_bar:
+                                prev_sig = check_value_in_buckets(sub_df['CRSI_2D'].iloc[idx_bar - 1], selected_buckets)
+                                curr_sig = check_value_in_buckets(b_crsi_2d, selected_buckets)
+                                if entry_timing == "Next Open" and prev_sig:
+                                    in_trade = True
+                                    bars_held_sim = 0
+                                elif entry_timing == "Signal Day Close" and curr_sig:
+                                    in_trade = True
+                                    bars_held_sim = 0
+                                    
+                        latest = df_calc.iloc[-1]
+                        crsi_2d = latest['CRSI_2D']
+                        atr_pct_14 = latest['ATR_Pct_14']
+                        crsi_today = latest['CRSI']
+                        rsi3_today = latest['RSI3']
+                        is_falling = bool(latest[falling_col])
+                        
+                        in_selected_bucket = check_value_in_buckets(crsi_2d, selected_buckets)
+                        passes_falling = (not require_falling_rsi) or is_falling
+                        
+                        current_b_name = "None"
+                        for b_name, (b_min, b_max) in BUCKET_RANGES.items():
+                            if b_min <= crsi_2d <= b_max:
+                                current_b_name = b_name
+                                break
+                                
+                        status = "⚪ NEUTRAL"
+                        if in_trade:
+                            bars_held_sim += 1
+                            hit_c = crsi_2d > crsi_exit_thresh
+                            hit_xh = pd.notna(latest['X_Day_High']) and (latest['High'] >= latest['X_Day_High'])
+                            hit_time = (effective_max_bars > 0) and (bars_held_sim >= effective_max_bars)
+                            
+                            if hit_c or hit_xh or hit_time:
+                                status = "🚨 EXIT MET"
+                            else:
+                                status = "🟡 HOLDING"
+                        elif in_selected_bucket and passes_falling:
+                            if vix_is_currently_blocking:
+                                status = "⛔ BLOCKED (VIX Alert)"
+                            else:
+                                status = "🟢 BUY SIGNAL"
+                                
+                        results.append({
+                            "Ticker": t,
+                            "Status": status,
+                            "2-Day CRSI": round(crsi_2d, 2),
+                            "14-Day ATR (%)": round(atr_pct_14, 2),
+                            "Current Bucket": current_b_name,
+                            "CRSI Today": round(crsi_today, 2),
+                            "RSI(3) Today": round(rsi3_today, 2),
+                            "Close": round(latest['Close'], 2),
+                            "X-Day High": round(latest['X_Day_High'], 2) if pd.notna(latest['X_Day_High']) else np.nan
+                        })
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            pbar.progress((c + 1) / num_chunks)
+            
+        pbar.empty()
+        s_text.empty()
+        
+        if results:
+            res_df = pd.DataFrame(results)
+            if only_actionable:
+                res_df = res_df[res_df['Status'] != "⚪ NEUTRAL"]
+                
+            # Sort screener table according to selected tie-breaker
+            if rank_method == "Highest 14-Day ATR (%)":
+                res_df = res_df.sort_values(by="14-Day ATR (%)", ascending=False)
+            else:
+                res_df = res_df.sort_values(by="2-Day CRSI", ascending=True)
+                
+            n_buys = len(res_df[res_df['Status'] == "🟢 BUY SIGNAL"])
+            n_holding = len(res_df[res_df['Status'] == "🟡 HOLDING"])
+            n_exits = len(res_df[res_df['Status'] == "🚨 EXIT MET"])
+            
+            c_res1, c_res2, c_res3, c_res4 = st.columns(4)
+            c_res1.metric("Total Scanned", len(results))
+            c_res2.metric("Active Buy Signals", n_buys)
+            c_res3.metric("Currently Holding", n_holding)
+            c_res4.metric("Exit Signals", n_exits)
+            
+            st.dataframe(res_df, use_container_width=True, height=600)
+        else:
+            st.warning("No data retrieved.")
