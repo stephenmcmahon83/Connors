@@ -5,7 +5,6 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
-import urllib.request
 
 st.set_page_config(
     page_title="ConnorsRSI Universe Backtester, Screener & Charts",
@@ -73,11 +72,6 @@ def prepare_crsi_data(df: pd.DataFrame, x_days: int) -> pd.DataFrame:
 # ==========================================
 
 def create_candlestick_crsi_chart(df: pd.DataFrame, ticker: str, x_days: int) -> go.Figure:
-    """
-    Creates a synchronized 2-row subplot:
-    Row 1: Candlestick chart + Prior X-Day High line
-    Row 2: 2-Day Average ConnorsRSI with horizontal thresholds at 10, 20, 30, 70, 80, 90
-    """
     fig = make_subplots(
         rows=2, cols=1,
         shared_xaxes=True,
@@ -86,7 +80,6 @@ def create_candlestick_crsi_chart(df: pd.DataFrame, ticker: str, x_days: int) ->
         subplot_titles=(f"{ticker} Candlestick Price Chart", "2-Day Average ConnorsRSI (CRSI_2D)")
     )
     
-    # 1. Candlestick Price Trace
     fig.add_trace(
         go.Candlestick(
             x=df.index,
@@ -101,7 +94,6 @@ def create_candlestick_crsi_chart(df: pd.DataFrame, ticker: str, x_days: int) ->
         row=1, col=1
     )
     
-    # Prior X-Day High Reference Line
     if 'X_Day_High' in df.columns:
         fig.add_trace(
             go.Scatter(
@@ -114,7 +106,6 @@ def create_candlestick_crsi_chart(df: pd.DataFrame, ticker: str, x_days: int) ->
             row=1, col=1
         )
         
-    # 2. 2-Day CRSI Line
     fig.add_trace(
         go.Scatter(
             x=df.index,
@@ -126,7 +117,6 @@ def create_candlestick_crsi_chart(df: pd.DataFrame, ticker: str, x_days: int) ->
         row=2, col=1
     )
     
-    # Horizontal Threshold Lines on Row 2 (10, 20, 30, 70, 80, 90)
     crsi_levels = [
         (10, "rgba(0, 200, 5, 0.9)", "dash"),
         (20, "rgba(0, 200, 5, 0.6)", "dot"),
@@ -181,15 +171,6 @@ BUCKET_RANGES = {
     "91 - 100": (90.0001, 100.0),
 }
 
-def get_bucket_mask(series: pd.Series, selected_buckets: list) -> pd.Series:
-    if not selected_buckets:
-        return pd.Series(False, index=series.index)
-    mask = pd.Series(False, index=series.index)
-    for b in selected_buckets:
-        lb, hb = BUCKET_RANGES[b]
-        mask = mask | ((series >= lb) & (series <= hb))
-    return mask
-
 def check_value_in_buckets(val: float, selected_buckets: list) -> bool:
     if not selected_buckets or pd.isna(val):
         return False
@@ -226,18 +207,513 @@ RUSSELL_REPRESENTATIVE = [
 @st.cache_data(ttl=86400)
 def get_sp500_tickers() -> list:
     try:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as resp:
-            tables = pd.read_html(resp)
-        return sorted(tables[0]['Symbol'].str.replace('.', '-', regex=False).tolist())
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
+        df_sp = pd.read_csv(url)
+        return sorted(df_sp['Symbol'].str.replace('.', '-', regex=False).tolist())
     except Exception:
         return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "BRK-B", "JPM", "V", "UNH"]
 
 @st.cache_data(ttl=86400)
 def get_nasdaq100_tickers() -> list:
     try:
-        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as resp:
-            tables = pd.read_html(resp)
+        url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_tickers.txt"
+        df_ndx = pd.read_csv(url, header=None, names=['Symbol'])
+        return sorted(df_ndx['Symbol'].str.replace('.', '-', regex=False).tolist()[:100])
+    except Exception:
+        return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "COST", "AVGO", "TSLA", "AMD"]
+
+# ==========================================
+# 5. UNIVERSE ENGINE WITH COMMISSIONS & NAN PROTECTION
+# ==========================================
+
+def run_universe_backtest(
+    data_dict: dict,
+    selected_buckets: list,
+    exit_mode: str,
+    x_days: int,
+    crsi_exit_thresh: float,
+    require_falling: bool,
+    falling_type: str,
+    entry_timing: str,
+    initial_capital: float,
+    max_positions: int,
+    commission_per_trade: float
+):
+    all_dates = sorted(list(set().union(*[df.index.tolist() for df in data_dict.values()])))
+    if len(all_dates) < 120:
+        return pd.DataFrame(), pd.DataFrame()
+
+    capital = initial_capital
+    active_positions = {}
+    trades = []
+    portfolio_equity = []
+    
+    falling_col = 'CRSI_Falling' if falling_type == "ConnorsRSI (CRSI)" else 'RSI3_Falling'
+
+    for i in range(1, len(all_dates)):
+        curr_date = all_dates[i]
+        prev_date = all_dates[i - 1]
+        
+        # 1. PROCESS EXITS
+        tickers_to_exit = []
+        for ticker, pos in list(active_positions.items()):
+            df = data_dict[ticker]
+            if curr_date not in df.index:
+                continue
+                
+            curr_bar = df.loc[curr_date]
+            c_close = curr_bar.get('Close', np.nan)
+            c_open = curr_bar.get('Open', np.nan)
+            c_high = curr_bar.get('High', np.nan)
+            c_crsi_2d = curr_bar.get('CRSI_2D', np.nan)
+            x_high = curr_bar.get('X_Day_High', np.nan)
+            
+            if pd.isna(c_close) or pd.isna(c_open) or pd.isna(c_crsi_2d):
+                continue
+            
+            hit_crsi = c_crsi_2d > crsi_exit_thresh
+            hit_x_high = pd.notna(x_high) and (c_high >= x_high)
+            
+            should_exit = False
+            exit_price = c_close
+            exit_reason = ""
+            
+            if exit_mode == "Either (Whichever occurs first)":
+                if hit_x_high and hit_crsi:
+                    exit_price = max(c_open, x_high)
+                    exit_reason = "Both (X-High & CRSI)"
+                    should_exit = True
+                elif hit_x_high:
+                    exit_price = max(c_open, x_high)
+                    exit_reason = "X-Day High"
+                    should_exit = True
+                elif hit_crsi:
+                    exit_price = c_close
+                    exit_reason = f"CRSI 2D > {crsi_exit_thresh}"
+                    should_exit = True
+            elif exit_mode == "Both Required":
+                if hit_x_high and hit_crsi:
+                    exit_price = c_close
+                    exit_reason = "Both Met"
+                    should_exit = True
+            elif exit_mode == "X-Day High Only" and hit_x_high:
+                exit_price = max(c_open, x_high)
+                exit_reason = "X-Day High"
+                should_exit = True
+            elif exit_mode == "2-Day CRSI Threshold Only" and hit_crsi:
+                exit_price = c_close
+                exit_reason = f"CRSI 2D > {crsi_exit_thresh}"
+                should_exit = True
+                
+            if should_exit and pd.notna(exit_price) and exit_price > 0:
+                gross_proceeds = pos['shares'] * exit_price
+                net_proceeds = gross_proceeds - commission_per_trade
+                total_commissions = pos['entry_commission'] + commission_per_trade
+                net_pnl = gross_proceeds - pos['gross_cost'] - total_commissions
+                net_ret_pct = (net_pnl / pos['gross_cost']) * 100.0
+                
+                capital += net_proceeds
+                
+                trades.append({
+                    'Ticker': ticker,
+                    'Entry Date': pos['entry_date'],
+                    'Entry Price': round(pos['entry_price'], 2),
+                    'Exit Date': curr_date,
+                    'Exit Price': round(exit_price, 2),
+                    'Exit Reason': exit_reason,
+                    'Shares': pos['shares'],
+                    'Hold Days': (curr_date - pos['entry_date']).days,
+                    'Commissions ($)': round(total_commissions, 2),
+                    'Net Return %': round(net_ret_pct, 2),
+                    'Net PnL ($)': round(net_pnl, 2)
+                })
+                tickers_to_exit.append(ticker)
+                
+        for t in tickers_to_exit:
+            del active_positions[t]
+            
+        # 2. PROCESS ENTRIES
+        available_slots = max_positions - len(active_positions)
+        if available_slots > 0 and selected_buckets:
+            candidates = []
+            
+            for ticker, df in data_dict.items():
+                if ticker in active_positions:
+                    continue
+                    
+                check_date = prev_date if entry_timing == "Next Open" else curr_date
+                if check_date not in df.index:
+                    continue
+                    
+                bar = df.loc[check_date]
+                crsi_2d = bar.get('CRSI_2D', np.nan)
+                
+                if pd.isna(crsi_2d):
+                    continue
+                
+                in_bucket = check_value_in_buckets(crsi_2d, selected_buckets)
+                passes_falling = True
+                if require_falling:
+                    passes_falling = bool(bar.get(falling_col, False))
+                    
+                if in_bucket and passes_falling:
+                    candidates.append({
+                        'Ticker': ticker,
+                        'CRSI_2D': crsi_2d
+                    })
+                    
+            if candidates:
+                candidates = sorted(candidates, key=lambda c: c['CRSI_2D'])[:available_slots]
+                
+                current_unrealized = 0.0
+                for t, pos in active_positions.items():
+                    if curr_date in data_dict[t].index:
+                        c_val = data_dict[t].loc[curr_date].get('Close', np.nan)
+                        current_unrealized += pos['shares'] * (c_val if pd.notna(c_val) and c_val > 0 else pos['entry_price'])
+                    else:
+                        current_unrealized += pos['gross_cost']
+                        
+                total_equity = max(capital + current_unrealized, 0.0)
+                target_slot_size = total_equity / max_positions
+                
+                for cand in candidates:
+                    t = cand['Ticker']
+                    df = data_dict[t]
+                    if curr_date not in df.index:
+                        continue
+                    
+                    target_col = 'Open' if entry_timing == "Next Open" else 'Close'
+                    buy_price = df.loc[curr_date].get(target_col, np.nan)
+                    
+                    if pd.isna(buy_price) or buy_price <= 0:
+                        continue
+                        
+                    avail_for_stock = min(capital, target_slot_size) - commission_per_trade
+                    if pd.isna(avail_for_stock) or avail_for_stock <= 0:
+                        continue
+                        
+                    shares = int(avail_for_stock // buy_price)
+                    
+                    if shares > 0:
+                        gross_cost = shares * buy_price
+                        total_outlay = gross_cost + commission_per_trade
+                        capital -= total_outlay
+                        
+                        active_positions[t] = {
+                            'entry_price': buy_price,
+                            'entry_date': curr_date,
+                            'shares': shares,
+                            'gross_cost': gross_cost,
+                            'entry_commission': commission_per_trade
+                        }
+        
+        # 3. DAILY PORTFOLIO TRACKING
+        open_val = 0.0
+        for t, pos in active_positions.items():
+            if curr_date in data_dict[t].index:
+                c_p = data_dict[t].loc[curr_date].get('Close', np.nan)
+                open_val += pos['shares'] * (c_p if pd.notna(c_p) and c_p > 0 else pos['entry_price'])
+            else:
+                open_val += pos['gross_cost']
+                
+        portfolio_equity.append({'Date': curr_date, 'Equity': capital + open_val})
+        
+    equity_df = pd.DataFrame(portfolio_equity).set_index('Date') if portfolio_equity else pd.DataFrame()
+    trades_df = pd.DataFrame(trades)
+    return trades_df, equity_df
+
+# ==========================================
+# 6. ANNUAL METRICS AGGREGATOR
+# ==========================================
+
+def calculate_annual_metrics(equity_df: pd.DataFrame, trades_df: pd.DataFrame, initial_capital: float) -> pd.DataFrame:
+    if equity_df.empty:
+        return pd.DataFrame()
+        
+    equity_df = equity_df.copy()
+    equity_df['Year'] = equity_df.index.year
+    years = sorted(equity_df['Year'].unique())
+    
+    if not trades_df.empty:
+        trades_df = trades_df.copy()
+        trades_df['Exit Year'] = pd.to_datetime(trades_df['Exit Date']).dt.year
+    else:
+        trades_df = pd.DataFrame(columns=['Exit Year', 'Net PnL ($)'])
+        
+    annual_data = []
+    
+    for idx, yr in enumerate(years):
+        yr_equity = equity_df[equity_df['Year'] == yr]['Equity']
+        
+        if idx == 0:
+            start_eq = initial_capital
+        else:
+            prev_yr = years[idx - 1]
+            prev_yr_equity = equity_df[equity_df['Year'] == prev_yr]['Equity']
+            start_eq = prev_yr_equity.iloc[-1]
+            
+        end_eq = yr_equity.iloc[-1]
+        yr_return = ((end_eq / start_eq) - 1) * 100.0
+        
+        roll_max = yr_equity.cummax()
+        dd = (yr_equity - roll_max) / roll_max
+        max_dd = dd.min() * 100.0
+        
+        yr_trades = trades_df[trades_df['Exit Year'] == yr]
+        n_trades = len(yr_trades)
+        
+        if n_trades > 0:
+            wins = yr_trades[yr_trades['Net PnL ($)'] > 0]
+            losses = yr_trades[yr_trades['Net PnL ($)'] < 0]
+            win_rate = (len(wins) / n_trades) * 100.0
+            net_pnl = yr_trades['Net PnL ($)'].sum()
+            
+            gross_p = wins['Net PnL ($)'].sum()
+            gross_l = abs(losses['Net PnL ($)'].sum())
+            profit_factor = (gross_p / gross_l) if gross_l > 0 else (np.nan if gross_p == 0 else 999.0)
+        else:
+            win_rate = 0.0
+            net_pnl = 0.0
+            profit_factor = np.nan
+            
+        annual_data.append({
+            'Year': int(yr),
+            'Return %': round(yr_return, 2),
+            'Net PnL ($)': round(net_pnl, 2),
+            'Trades': n_trades,
+            'Win Rate %': round(win_rate, 1) if n_trades > 0 else "-",
+            'Profit Factor': round(profit_factor, 2) if pd.notna(profit_factor) and profit_factor != 999.0 else ("∞" if profit_factor == 999.0 else "-"),
+            'Max Drawdown %': round(max_dd, 1),
+            'Ending Equity ($)': round(end_eq, 2)
+        })
+        
+    return pd.DataFrame(annual_data)
+
+# ==========================================
+# 7. SIDEBAR CONTROLS
+# ==========================================
+
+st.sidebar.title("Strategy Rules")
+
+selected_buckets = st.sidebar.multiselect(
+    "1. Entry 2-Day ConnorsRSI Buckets",
+    options=list(BUCKET_RANGES.keys()),
+    default=["0 - 10", "11 - 20"],
+    help="Positions trigger when the 2-day CRSI closes in any of these buckets."
+)
+
+if not selected_buckets:
+    st.sidebar.warning("Select at least one bucket to generate entry signals.")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Momentum / Declining Filter")
+require_falling_rsi = st.sidebar.checkbox(
+    "Require Latest RSI < Prior Day RSI",
+    value=False,
+    help="When enabled, requires today's RSI reading to be strictly lower than yesterday's."
+)
+
+falling_type = st.sidebar.radio(
+    "RSI Metric for Falling Filter",
+    ["ConnorsRSI (CRSI)", "Price RSI (RSI-3)"],
+    index=0,
+    disabled=not require_falling_rsi
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Exit Rules")
+x_days = st.sidebar.slider("Exit: Prior X-Day High Lookback", min_value=1, max_value=20, value=5, step=1)
+crsi_exit_thresh = st.sidebar.selectbox("Exit: 2-Day CRSI Threshold (> N)", [0, 10, 20, 30, 40, 50, 60, 70, 80, 90], index=7)
+exit_mode = st.sidebar.selectbox(
+    "Exit Condition Logic",
+    ["Either (Whichever occurs first)", "X-Day High Only", "2-Day CRSI Threshold Only", "Both Required"]
+)
+entry_timing = st.sidebar.radio("Entry Execution", ["Next Open", "Signal Day Close"], horizontal=True)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Execution Friction")
+comm_per_order = st.sidebar.number_input(
+    "Commission per Order / Trade ($)",
+    min_value=0.0,
+    max_value=25.0,
+    value=2.00,
+    step=0.50,
+    help="Applied on both buy and sell orders ($2.00/order = $4.00 round trip)."
+)
+
+# ==========================================
+# 8. TABS
+# ==========================================
+
+tab_chart, tab_universe, tab_single, tab_screener = st.tabs([
+    "🕯️ Candlestick & CRSI Chart",
+    "🌐 20-Year Universe Backtester",
+    "📊 Single Ticker Multi-Bucket & Matrix",
+    "🔍 Live Market Screener"
+])
+
+# ------------------------------------------
+# TAB 1: INTERACTIVE CANDLESTICK & CRSI CHART
+# ------------------------------------------
+with tab_chart:
+    st.subheader("Interactive Candlestick Chart & 2-Day ConnorsRSI Indicator")
+    st.caption("Displays stock candlestick price action, prior X-day high level, and 2-Day CRSI with 10, 20, 30, 70, 80, 90 threshold lines.")
+    
+    c_col1, c_col2 = st.columns([1, 2])
+    with c_col1:
+        chart_ticker = st.text_input("Enter Stock Ticker Symbol", value="SPY", key="standalone_chart_ticker").upper()
+    with c_col2:
+        time_period = st.selectbox(
+            "Select Chart Timeframe Lookback",
+            ["3 Months", "6 Months", "1 Year", "2 Years", "5 Years"],
+            index=2
+        )
+        
+    period_map = {"3 Months": "3mo", "6 Months": "6mo", "1 Year": "1y", "2 Years": "2y", "5 Years": "5y"}
+    
+    with st.spinner(f"Loading chart for {chart_ticker}..."):
+        raw_chart = yf.download(chart_ticker, period=period_map[time_period], interval="1d", progress=False, auto_adjust=True)
+        if isinstance(raw_chart.columns, pd.MultiIndex):
+            raw_chart.columns = raw_chart.columns.get_level_values(0)
+            
+        if len(raw_chart) < 30:
+            st.error("Insufficient market data for this ticker/period combination.")
+        else:
+            calc_chart = prepare_crsi_data(raw_chart, x_days=x_days)
+            latest_bar = calc_chart.iloc[-1]
+            
+            sm1, sm2, sm3, sm4 = st.columns(4)
+            sm1.metric("Latest Close", f"${latest_bar['Close']:.2f}")
+            sm2.metric("2-Day CRSI", f"{latest_bar['CRSI_2D']:.2f}")
+            sm3.metric(f"Prior {x_days}-Day High", f"${latest_bar['X_Day_High']:.2f}" if pd.notna(latest_bar['X_Day_High']) else "N/A")
+            sm4.metric("CRSI Falling?", "✅ Yes" if latest_bar['CRSI_Falling'] else "❌ No")
+            
+            fig_candlestick = create_candlestick_crsi_chart(calc_chart, chart_ticker, x_days=x_days)
+            st.plotly_chart(fig_candlestick, use_container_width=True)
+
+# ------------------------------------------
+# TAB 2: 20-YEAR UNIVERSE PORTFOLIO BACKTEST
+# ------------------------------------------
+with tab_universe:
+    st.subheader("20-Year Multi-Asset Portfolio Backtest")
+    st.caption(
+        f"Simulating trades across selected buckets: **{', '.join(selected_buckets) if selected_buckets else 'None'}** "
+        f"| Commission: **${comm_per_order:.2f} per order** (${comm_per_order * 2:.2f} round trip)"
+    )
+    
+    u1, u2, u3 = st.columns([2, 1, 1])
+    with u1:
+        univ_choice = st.selectbox(
+            "Select Universe Basket:",
+            [
+                "Major Liquid ETFs (Complete List)",
+                "Full Nasdaq 100",
+                "Full S&P 500",
+                "Russell Representative & Growth",
+                "Top Global ADRs",
+                "Custom Ticker List"
+            ]
+        )
+    with u2:
+        start_year = st.selectbox("Start Year", options=list(range(2004, 2026)), index=2)
+    with u3:
+        initial_cap = st.number_input("Starting Capital ($)", value=25000.0, step=5000.0)
+
+    p1, p2 = st.columns(2)
+    with p1:
+        max_positions = st.slider("Max Concurrent Open Positions", min_value=1, max_value=30, value=5, step=1)
+    with p2:
+        custom_univ = st.text_input("Custom Ticker Basket (if selected):", value="SPY, QQQ, DIA, IWM, SMH, XLF, XLE, GLD, TLT")
+
+    if st.button("🚀 Run Universe Backtest", type="primary"):
+        if not selected_buckets:
+            st.error("Please select at least one ConnorsRSI bucket in the sidebar.")
+            st.stop()
+            
+        if univ_choice == "Major Liquid ETFs (Complete List)":
+            ticker_list = MAJOR_ETFS
+        elif univ_choice == "Full Nasdaq 100":
+            ticker_list = get_nasdaq100_tickers()
+        elif univ_choice == "Full S&P 500":
+            ticker_list = get_sp500_tickers()
+        elif univ_choice == "Russell Representative & Growth":
+            ticker_list = RUSSELL_REPRESENTATIVE
+        elif univ_choice == "Top Global ADRs":
+            ticker_list = TOP_ADRS
+        else:
+            ticker_list = [t.strip().upper() for t in custom_univ.split(",") if t.strip()]
+
+        st.info(f"Downloading historical data since {start_year} for all {len(ticker_list)} symbols...")
+        
+        data_dict = {}
+        chunk_size = 50
+        num_chunks = int(np.ceil(len(ticker_list) / chunk_size))
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+        
+        start_dt = datetime(start_year, 1, 1)
+        
+        for c in range(num_chunks):
+            chunk = ticker_list[c * chunk_size : (c + 1) * chunk_size]
+            status_text.text(f"Downloading chunk {c + 1}/{num_chunks} ({len(chunk)} tickers)...")
+            try:
+                b_data = yf.download(
+                    chunk,
+                    start=start_dt,
+                    interval="1d",
+                    group_by="ticker",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=True
+                )
+                for t in chunk:
+                    try:
+                        if isinstance(b_data.columns, pd.MultiIndex):
+                            if t in b_data.columns.get_level_values(0):
+                                df_t = b_data[t].dropna(how='all')
+                            else:
+                                continue
+                        else:
+                            df_t = b_data.dropna(how='all')
+                            
+                        if len(df_t) >= 120:
+                            data_dict[t] = prepare_crsi_data(df_t, x_days=x_days)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            progress_bar.progress((c + 1) / num_chunks)
+            
+        progress_bar.empty()
+        status_text.empty()
+        
+        if not data_dict:
+            st.error("No valid historical price data retrieved.")
+        else:
+            with st.spinner("Simulating multi-asset portfolio with commissions..."):
+                trades_df, equity_df = run_universe_backtest(
+                    data_dict=data_dict,
+                    selected_buckets=selected_buckets,
+                    exit_mode=exit_mode,
+                    x_days=x_days,
+                    crsi_exit_thresh=crsi_exit_thresh,
+                    require_falling=require_falling_rsi,
+                    falling_type=falling_type,
+                    entry_timing=entry_timing,
+                    initial_capital=initial_cap,
+                    max_positions=max_positions,
+                    commission_per_trade=comm_per_order
+                )
+                
+            if trades_df.empty:
+                st.warning("No trades were triggered for the selected bucket(s) during this timeframe.")
+            else:
+                n_trades = len(trades_df)
+                wins = trades_df[trades_df['Net PnL ($)'] > 0]
+                losses = trades_df[trades_df['Net PnL ($)'] < 0]
+                win_rate = (len(wins) / n_trades) * 100.0
+                
+                final_eq = equity_df['Equity'].iloc[-1]
+                tot_ret = ((final_eq / initial_cap) - 1) * 100.0
+                years = max((equity_df.index[-1] - equity_df.index[0]).days / 365.25, 1.0)
+                cagr = (((final_eq / initial_cap) ** (1 / years)) - 1
