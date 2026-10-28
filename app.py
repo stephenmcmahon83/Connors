@@ -75,7 +75,6 @@ def prepare_crsi_data(df: pd.DataFrame, x_days: int) -> pd.DataFrame:
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
         
-    # Strictly coerce OHLC columns to numeric and drop incomplete/NaN trailing rows from yfinance
     ohlc_cols = ['Open', 'High', 'Low', 'Close']
     for col in ohlc_cols:
         if col in df.columns:
@@ -150,7 +149,7 @@ def create_candlestick_crsi_chart(df: pd.DataFrame, ticker: str, x_days: int, tr
         shared_xaxes=True,
         vertical_spacing=0.05,
         row_heights=[0.70, 0.30],
-        subplot_titles=(f"{ticker} Candlestick Chart (System Entries & Exits)", "2-Day Average ConnorsRSI (CRSI_2D)")
+        subplot_titles=(f"{ticker} Candlestick Chart (System Entries, Exits & Active Trades)", "2-Day Average ConnorsRSI (CRSI_2D)")
     )
     
     fig.add_trace(
@@ -186,6 +185,7 @@ def create_candlestick_crsi_chart(df: pd.DataFrame, ticker: str, x_days: int, tr
         win_exits_x, win_exits_y, win_exits_text = [], [], []
         loss_entries_x, loss_entries_y, loss_entries_text = [], [], []
         loss_exits_x, loss_exits_y, loss_exits_text = [], [], []
+        open_entries_x, open_entries_y, open_entries_text = [], [], []
         win_lines_x, win_lines_y = [], []
         loss_lines_x, loss_lines_y = [], []
         
@@ -199,28 +199,42 @@ def create_candlestick_crsi_chart(df: pd.DataFrame, ticker: str, x_days: int, tr
             
             pnl = trade.get('Net PnL ($)', trade.get('PnL ($)', 0.0))
             ret = trade.get('Net Return %', trade.get('Return %', 0.0))
-            reason = trade.get('Exit Reason', 'Exit Trigger')
+            reason = str(trade.get('Exit Reason', 'Exit Trigger'))
             pos_size = trade.get('Position Size ($)', 0.0)
+            is_open_trade = "OPEN" in reason
             is_win = pnl > 0
             
             if e_date in df_index_set:
-                txt_e = (
-                    f"<b>🟢 BUY ENTRY</b><br>"
-                    f"Date: {pd.to_datetime(e_date).strftime('%Y-%m-%d')}<br>"
-                    f"Price: ${e_price:.2f}<br>"
-                    f"Pos Size: ${pos_size:,.2f}<br>"
-                    f"Result: {'WIN (+)' if is_win else 'LOSS (-)'} ({ret:+.2f}%)"
-                )
-                if is_win:
-                    win_entries_x.append(e_date)
-                    win_entries_y.append(e_price)
-                    win_entries_text.append(txt_e)
+                if is_open_trade:
+                    txt_open = (
+                        f"<b>🔵 ACTIVE OPEN POSITION</b><br>"
+                        f"Entry Date: {pd.to_datetime(e_date).strftime('%Y-%m-%d')}<br>"
+                        f"Entry Price: ${e_price:.2f}<br>"
+                        f"Pos Size: ${pos_size:,.2f}<br>"
+                        f"Unrealized: ${pnl:+.2f} ({ret:+.2f}%)<br>"
+                        f"Status: {reason}"
+                    )
+                    open_entries_x.append(e_date)
+                    open_entries_y.append(e_price)
+                    open_entries_text.append(txt_open)
                 else:
-                    loss_entries_x.append(e_date)
-                    loss_entries_y.append(e_price)
-                    loss_entries_text.append(txt_e)
+                    txt_e = (
+                        f"<b>🟢 BUY ENTRY</b><br>"
+                        f"Date: {pd.to_datetime(e_date).strftime('%Y-%m-%d')}<br>"
+                        f"Price: ${e_price:.2f}<br>"
+                        f"Pos Size: ${pos_size:,.2f}<br>"
+                        f"Result: {'WIN (+)' if is_win else 'LOSS (-)'} ({ret:+.2f}%)"
+                    )
+                    if is_win:
+                        win_entries_x.append(e_date)
+                        win_entries_y.append(e_price)
+                        win_entries_text.append(txt_e)
+                    else:
+                        loss_entries_x.append(e_date)
+                        loss_entries_y.append(e_price)
+                        loss_entries_text.append(txt_e)
                     
-            if x_date in df_index_set:
+            if not is_open_trade and x_date in df_index_set:
                 txt_x = (
                     f"<b>🔴 SELL EXIT</b><br>"
                     f"Date: {pd.to_datetime(x_date).strftime('%Y-%m-%d')}<br>"
@@ -237,7 +251,7 @@ def create_candlestick_crsi_chart(df: pd.DataFrame, ticker: str, x_days: int, tr
                     loss_exits_y.append(x_price)
                     loss_exits_text.append(txt_x)
                     
-            if e_date in df_index_set and x_date in df_index_set:
+            if not is_open_trade and e_date in df_index_set and x_date in df_index_set:
                 if is_win:
                     win_lines_x.extend([e_date, x_date, None])
                     win_lines_y.extend([e_price, x_price, None])
@@ -285,6 +299,13 @@ def create_candlestick_crsi_chart(df: pd.DataFrame, ticker: str, x_days: int, tr
                 x=loss_exits_x, y=loss_exits_y, mode='markers',
                 marker=dict(symbol='triangle-down', size=11, color='#FF333A', line=dict(width=1, color='#660000')),
                 name="Loss Exit", hovertext=loss_exits_text, hoverinfo='text'
+            ), row=1, col=1)
+            
+        if open_entries_x:
+            fig.add_trace(go.Scatter(
+                x=open_entries_x, y=open_entries_y, mode='markers',
+                marker=dict(symbol='triangle-up', size=13, color='#00B0FF', line=dict(width=1.5, color='#003366')),
+                name="Active Open Trade", hovertext=open_entries_text, hoverinfo='text'
             ), row=1, col=1)
             
     fig.add_trace(
@@ -389,11 +410,11 @@ RUSSELL_REPRESENTATIVE = [
 @st.cache_data(ttl=86400)
 def get_sp500_tickers() -> list:
     try:
-        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
         df_sp = pd.read_csv(url)
         return sorted(df_sp['Symbol'].str.replace('.', '-', regex=False).tolist())
     except Exception:
-        return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "BRK-B", "JPM", "V", "UNH"]
+        return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "BRK-B", "JPM", "V", "UNH", "RDDT"]
 
 @st.cache_data(ttl=86400)
 def get_nasdaq100_tickers() -> list:
@@ -405,7 +426,7 @@ def get_nasdaq100_tickers() -> list:
         return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "COST", "AVGO", "TSLA", "AMD"]
 
 # ==========================================
-# 6. UNIVERSE ENGINE WITH POSITION SIZING MODES
+# 6. UNIVERSE ENGINE WITH OPEN POSITION LOGGING
 # ==========================================
 
 def run_universe_backtest(
@@ -423,7 +444,8 @@ def run_universe_backtest(
     vix_blocked_dates: set = None,
     max_bars_stop: int = 0,
     rank_method: str = "Lowest 2-Day ConnorsRSI",
-    reinvest_profits: bool = False
+    reinvest_profits: bool = False,
+    include_open_positions: bool = False
 ):
     all_dates = sorted(list(set().union(*[df.index.tolist() for df in data_dict.values()])))
     if len(all_dates) < 120:
@@ -609,13 +631,15 @@ def run_universe_backtest(
                         total_outlay = gross_cost + commission_per_trade
                         capital -= total_outlay
                         
+                        # If entered on Next Open of curr_date, curr_date is Bar 1 of holding
+                        initial_bars = 1 if entry_timing == "Next Open" else 0
                         active_positions[t] = {
                             'entry_price': buy_price,
                             'entry_date': curr_date,
                             'shares': shares,
                             'gross_cost': gross_cost,
                             'entry_commission': commission_per_trade,
-                            'bars_held': 0,
+                            'bars_held': initial_bars,
                             'setup_crsi': cand['CRSI_2D'],
                             'setup_atr_pct': cand['ATR_Pct_14']
                         }
@@ -630,7 +654,34 @@ def run_universe_backtest(
                 open_val += pos['gross_cost']
                 
         portfolio_equity.append({'Date': curr_date, 'Equity': capital + open_val})
-        
+
+    # Optional: Append currently open positions so they appear on charts and single-ticker logs
+    if include_open_positions and active_positions:
+        last_dt = all_dates[-1]
+        for ticker, pos in active_positions.items():
+            df = data_dict[ticker]
+            latest_close = float(df['Close'].iloc[-1])
+            gross_val = pos['shares'] * latest_close
+            unreal_pnl = gross_val - pos['gross_cost'] - pos['entry_commission']
+            unreal_ret = (unreal_pnl / pos['gross_cost']) * 100.0
+            trades.append({
+                'Ticker': ticker,
+                'Entry Date': pos['entry_date'],
+                'Entry Price': round(pos['entry_price'], 2),
+                'Exit Date': last_dt,
+                'Exit Price': round(latest_close, 2),
+                'Exit Reason': f"OPEN (Holding Bar {pos['bars_held']})",
+                'Shares': pos['shares'],
+                'Position Size ($)': round(pos['gross_cost'], 2),
+                'Hold Days': (last_dt - pos['entry_date']).days,
+                'Hold Bars': pos['bars_held'],
+                'Setup 2D-CRSI': round(pos.get('setup_crsi', 0.0), 2),
+                'Setup ATR(14)%': round(pos.get('setup_atr_pct', 0.0), 2),
+                'Commissions ($)': round(pos['entry_commission'], 2),
+                'Net Return %': round(unreal_ret, 2),
+                'Net PnL ($)': round(unreal_pnl, 2)
+            })
+
     equity_df = pd.DataFrame(portfolio_equity).set_index('Date') if portfolio_equity else pd.DataFrame()
     trades_df = pd.DataFrame(trades)
     return trades_df, equity_df
@@ -648,10 +699,10 @@ def calculate_annual_metrics(equity_df: pd.DataFrame, trades_df: pd.DataFrame, i
     years = sorted(equity_df['Year'].unique())
     
     if not trades_df.empty:
-        trades_df = trades_df.copy()
-        trades_df['Exit Year'] = pd.to_datetime(trades_df['Exit Date']).dt.year
+        closed_trades = trades_df[~trades_df['Exit Reason'].astype(str).str.contains('OPEN', na=False)].copy()
+        closed_trades['Exit Year'] = pd.to_datetime(closed_trades['Exit Date']).dt.year
     else:
-        trades_df = pd.DataFrame(columns=['Exit Year', 'Net PnL ($)'])
+        closed_trades = pd.DataFrame(columns=['Exit Year', 'Net PnL ($)'])
         
     annual_data = []
     
@@ -672,7 +723,7 @@ def calculate_annual_metrics(equity_df: pd.DataFrame, trades_df: pd.DataFrame, i
         dd = (yr_equity - roll_max) / roll_max
         max_dd = dd.min() * 100.0
         
-        yr_trades = trades_df[trades_df['Exit Year'] == yr]
+        yr_trades = closed_trades[closed_trades['Exit Year'] == yr]
         n_trades = len(yr_trades)
         
         if n_trades > 0:
@@ -861,15 +912,15 @@ tab_chart, tab_universe, tab_single, tab_screener = st.tabs([
 # TAB 1: INTERACTIVE CANDLESTICK & CRSI CHART
 # ------------------------------------------
 with tab_chart:
-    st.subheader("Candlestick Chart with System Entry & Exit Ticks")
+    st.subheader("Candlestick Chart with System Entry, Exit & Active Trade Ticks")
     st.caption(
         f"Position Sizing: **{sizing_mode_label}** (Base: **\\${base_pos_size:,.2f}**) | "
-        "Green triangles = profitable trades; Red triangles = unprofitable trades."
+        "Green = Win, Red = Loss, Blue = Currently Open Position."
     )
     
     c_col1, c_col2 = st.columns([1, 2])
     with c_col1:
-        chart_ticker = st.text_input("Enter Stock Ticker Symbol", value="SOXL", key="standalone_chart_ticker").upper()
+        chart_ticker = st.text_input("Enter Stock Ticker Symbol", value="RDDT", key="standalone_chart_ticker").upper()
     with c_col2:
         time_period = st.selectbox(
             "Select Chart Timeframe Lookback",
@@ -912,7 +963,8 @@ with tab_chart:
                 vix_blocked_dates=vix_blocked,
                 max_bars_stop=effective_max_bars,
                 rank_method=rank_method,
-                reinvest_profits=reinvest_profits_flag
+                reinvest_profits=reinvest_profits_flag,
+                include_open_positions=True
             )
             
             cutoff = datetime.today() - timedelta(days=lookback_days)
@@ -923,6 +975,22 @@ with tab_chart:
                 display_chart = calc_chart.iloc[-60:]
                 
             latest_bar = display_chart.iloc[-1]
+            has_open_pos = not trades_chart.empty and "OPEN" in str(trades_chart.iloc[-1]['Exit Reason'])
+            in_buy_bucket_today = check_value_in_buckets(float(latest_bar['CRSI_2D']), selected_buckets)
+            
+            if has_open_pos:
+                open_row = trades_chart.iloc[-1]
+                st.info(
+                    f"🔵 **ACTIVE OPEN POSITION IN {chart_ticker}**: Entered on **{pd.to_datetime(open_row['Entry Date']).strftime('%Y-%m-%d')}** "
+                    f"at **\\${open_row['Entry Price']:.2f}** ({open_row['Shares']} shares) | "
+                    f"Status: **{open_row['Exit Reason']}** | Unrealized PnL: **\\${open_row['Net PnL ($)']:.2f} ({open_row['Net Return %']:+.2f}%)**"
+                )
+            elif in_buy_bucket_today:
+                st.success(
+                    f"🟢 **NEW BUY SIGNAL TRIGGERED TODAY ({display_chart.index[-1].strftime('%Y-%m-%d')})**: "
+                    f"{chart_ticker} closed with 2-Day CRSI = **{latest_bar['CRSI_2D']:.2f}** (<= 20). "
+                    f"Staged to enter on **Next Market Open**."
+                )
             
             sm1, sm2, sm3, sm4, sm5 = st.columns(5)
             sm1.metric("Latest Close", f"${latest_bar['Close']:.2f}")
@@ -931,14 +999,14 @@ with tab_chart:
             sm4.metric(f"Prior {x_days}-Day High", f"${latest_bar['X_Day_High']:.2f}" if pd.notna(latest_bar['X_Day_High']) else "N/A")
             
             vis_trades = trades_chart[trades_chart['Entry Date'] >= display_chart.index[0]] if not trades_chart.empty else pd.DataFrame()
-            sm5.metric("Visible Trades", len(vis_trades))
+            sm5.metric("Visible Trades (Incl. Open)", len(vis_trades))
             
             fig_candlestick = create_candlestick_crsi_chart(display_chart, chart_ticker, x_days=x_days, trades_df=trades_chart)
             st.plotly_chart(fig_candlestick, use_container_width=True)
             
             if not vis_trades.empty:
-                with st.expander(f"View {len(vis_trades)} System Trades Plotted Above"):
-                    st.dataframe(vis_trades, use_container_width=True)
+                with st.expander(f"View {len(vis_trades)} System Trades Plotted Above", expanded=True):
+                    st.dataframe(vis_trades.sort_values(by="Entry Date", ascending=False), use_container_width=True)
 
 # ------------------------------------------
 # TAB 2: 20-YEAR UNIVERSE PORTFOLIO BACKTEST
@@ -1061,7 +1129,8 @@ with tab_universe:
                     vix_blocked_dates=vix_blocked,
                     max_bars_stop=effective_max_bars,
                     rank_method=rank_method,
-                    reinvest_profits=reinvest_profits_flag
+                    reinvest_profits=reinvest_profits_flag,
+                    include_open_positions=False
                 )
                 
             if trades_df.empty:
@@ -1080,8 +1149,6 @@ with tab_universe:
                 gp = wins['Net PnL ($)'].sum()
                 gl = abs(losses['Net PnL ($)'].sum())
                 pf = (gp / gl) if gl > 0 else np.nan
-                
-                time_stopped_trades = len(trades_df[trades_df['Exit Reason'].str.contains('Time Stop', na=False)])
                 
                 roll_max = equity_df['Equity'].cummax()
                 drawdown = (equity_df['Equity'] - roll_max) / roll_max
@@ -1160,7 +1227,7 @@ with tab_single:
     
     s_col1, s_col2 = st.columns(2)
     with s_col1:
-        st_ticker = st.text_input("Symbol", value="SPY", key="st_ticker_input").upper()
+        st_ticker = st.text_input("Symbol", value="RDDT", key="st_ticker_input").upper()
     with s_col2:
         st_start_year = st.selectbox("Historical Start Year", [2004, 2006, 2010, 2015, 2020], index=1, key="st_yr")
         
@@ -1194,7 +1261,8 @@ with tab_single:
                     vix_blocked_dates=vix_blocked,
                     max_bars_stop=effective_max_bars,
                     rank_method=rank_method,
-                    reinvest_profits=reinvest_profits_flag
+                    reinvest_profits=reinvest_profits_flag,
+                    include_open_positions=True
                 )
                 
                 st.markdown("#### 🔍 Price Action & System Trades (Last 1 Year)")
@@ -1210,15 +1278,15 @@ with tab_single:
                     tot_ret_s = ((eq_single['Equity'].iloc[-1] / base_pos_size) - 1) * 100
                     
                     c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Total Trades", n_s)
+                    c1.metric("Total Trades (Incl. Open)", n_s)
                     c2.metric("Win Rate", f"{wr_s:.1f}%")
                     c3.metric("Net Total Return", f"{tot_ret_s:.1f}%")
                     c4.metric("Total Net PnL", f"${t_single['Net PnL ($)'].sum():,.2f}")
                     
-                    st.dataframe(t_single, use_container_width=True)
+                    st.dataframe(t_single.sort_values(by="Entry Date", ascending=False), use_container_width=True)
 
 # ------------------------------------------
-# TAB 4: LIVE MARKET SCREENER
+# TAB 4: LIVE MARKET SCREENER (UNIFIED WITH BACKTEST ENGINE)
 # ------------------------------------------
 with tab_screener:
     st.subheader("Market Screener: Full Universes")
@@ -1263,7 +1331,7 @@ with tab_screener:
         default=["Full S&P 500", "Major US ETFs"]
     )
     
-    only_actionable = st.checkbox("Show Only Buy Signals, Holdings & Exits", value=True)
+    only_actionable = st.checkbox("Show Only Actionable Signals (Buys, Holdings & Exits)", value=True)
     
     if st.button("🚀 Run Live Screener Across All Tickers", type="primary"):
         if not selected_buckets:
@@ -1320,47 +1388,28 @@ with tab_screener:
                         if len(df_calc) < 120:
                             continue
                         
-                        sub_df = df_calc.iloc[-40:].copy()
-                        in_trade = False
-                        bars_held_sim = 0
+                        # Use the exact backtest engine on this symbol to determine current live state
+                        t_sim, _ = run_universe_backtest(
+                            data_dict={t: df_calc},
+                            selected_buckets=selected_buckets,
+                            exit_mode=exit_mode,
+                            x_days=x_days,
+                            crsi_exit_thresh=crsi_exit_thresh,
+                            require_falling=require_falling_rsi,
+                            falling_type=falling_type,
+                            entry_timing=entry_timing,
+                            base_position_size=base_pos_size,
+                            max_positions=1,
+                            commission_per_trade=comm_per_order,
+                            vix_blocked_dates=set(),
+                            max_bars_stop=effective_max_bars,
+                            rank_method=rank_method,
+                            reinvest_profits=False,
+                            include_open_positions=True
+                        )
                         
-                        for idx_bar in range(1, len(sub_df) - 1):
-                            b_high = sub_df['High'].iloc[idx_bar]
-                            b_crsi_2d = sub_df['CRSI_2D'].iloc[idx_bar]
-                            b_x_high = sub_df['X_Day_High'].iloc[idx_bar]
-                            
-                            if in_trade:
-                                bars_held_sim += 1
-                                hit_c = b_crsi_2d > crsi_exit_thresh
-                                hit_xh = pd.notna(b_x_high) and (b_high >= b_x_high)
-                                exit_now = False
-                                
-                                if exit_mode == "Either (Whichever occurs first)" and (hit_c or hit_xh):
-                                    exit_now = True
-                                elif exit_mode == "Both Required" and (hit_c and hit_xh):
-                                    exit_now = True
-                                elif exit_mode == "X-Day High Only" and hit_xh:
-                                    exit_now = True
-                                elif exit_mode == "2-Day CRSI Threshold Only" and hit_c:
-                                    exit_now = True
-                                    
-                                if not exit_now and (effective_max_bars > 0) and (bars_held_sim >= effective_max_bars):
-                                    exit_now = True
-                                    
-                                if exit_now:
-                                    in_trade = False
-                                    
-                            if not in_trade:
-                                prev_sig = check_value_in_buckets(sub_df['CRSI_2D'].iloc[idx_bar - 1], selected_buckets)
-                                curr_sig = check_value_in_buckets(b_crsi_2d, selected_buckets)
-                                if entry_timing == "Next Open" and prev_sig:
-                                    in_trade = True
-                                    bars_held_sim = 0
-                                elif entry_timing == "Signal Day Close" and curr_sig:
-                                    in_trade = True
-                                    bars_held_sim = 0
-                                    
                         latest = df_calc.iloc[-1]
+                        last_date = df_calc.index[-1]
                         crsi_2d = float(latest['CRSI_2D'])
                         atr_pct_14 = float(latest['ATR_Pct_14'])
                         crsi_today = float(latest['CRSI'])
@@ -1379,27 +1428,38 @@ with tab_screener:
                                 break
                                 
                         status = "⚪ NEUTRAL"
-                        if in_trade:
-                            bars_held_sim += 1
-                            hit_c = crsi_2d > crsi_exit_thresh
-                            hit_xh = pd.notna(x_high_today) and (latest['High'] >= x_high_today)
-                            hit_time = (effective_max_bars > 0) and (bars_held_sim >= effective_max_bars)
+                        hold_bars_val = 0
+                        
+                        if not t_sim.empty:
+                            last_trade = t_sim.iloc[-1]
+                            is_open = "OPEN" in str(last_trade['Exit Reason'])
+                            exited_today = (not is_open) and (pd.to_datetime(last_trade['Exit Date']) == last_date)
+                            entered_today = is_open and (pd.to_datetime(last_trade['Entry Date']) == last_date)
                             
-                            if hit_c or hit_xh or hit_time:
-                                status = "🚨 EXIT MET"
-                            else:
-                                status = "🟡 HOLDING"
-                        elif in_selected_bucket and passes_falling:
+                            if is_open:
+                                hold_bars_val = int(last_trade['Hold Bars'])
+                                if entered_today:
+                                    status = "🔵 ENTERED TODAY (Bar 1)"
+                                else:
+                                    status = f"🟡 HOLDING (Bar {hold_bars_val})"
+                            elif exited_today:
+                                if in_selected_bucket and passes_falling:
+                                    status = "🟢 BUY SIGNAL (Reload)"
+                                else:
+                                    status = f"🚨 EXIT MET ({last_trade['Exit Reason']})"
+                                    
+                        if status == "⚪ NEUTRAL" and in_selected_bucket and passes_falling:
                             if vix_is_currently_blocking:
                                 status = "⛔ BLOCKED (VIX Alert)"
                             else:
-                                status = "🟢 BUY SIGNAL"
+                                status = "🟢 BUY SIGNAL (Next Open)"
                                 
                         results.append({
                             "Ticker": t,
                             "Status": status,
                             "2-Day CRSI": round(crsi_2d, 2),
                             "14-Day ATR (%)": round(atr_pct_14, 2),
+                            "Hold Bars": hold_bars_val,
                             "Current Bucket": current_b_name,
                             "CRSI Today": round(crsi_today, 2),
                             "RSI(3) Today": round(rsi3_today, 2),
@@ -1425,15 +1485,17 @@ with tab_screener:
             else:
                 res_df = res_df.sort_values(by="2-Day CRSI", ascending=True)
                 
-            n_buys = len(res_df[res_df['Status'] == "🟢 BUY SIGNAL"])
-            n_holding = len(res_df[res_df['Status'] == "🟡 HOLDING"])
-            n_exits = len(res_df[res_df['Status'] == "🚨 EXIT MET"])
+            n_buys = len(res_df[res_df['Status'].str.contains("BUY SIGNAL")])
+            n_entered = len(res_df[res_df['Status'].str.contains("ENTERED TODAY")])
+            n_holding = len(res_df[res_df['Status'].str.contains("HOLDING")])
+            n_exits = len(res_df[res_df['Status'].str.contains("EXIT MET")])
             
-            c_res1, c_res2, c_res3, c_res4 = st.columns(4)
+            c_res1, c_res2, c_res3, c_res4, c_res5 = st.columns(5)
             c_res1.metric("Total Scanned", len(results))
-            c_res2.metric("Active Buy Signals", n_buys)
-            c_res3.metric("Currently Holding", n_holding)
-            c_res4.metric("Exit Signals", n_exits)
+            c_res2.metric("Buy Signals (Next Open)", n_buys)
+            c_res3.metric("Entered Today (Bar 1)", n_entered)
+            c_res4.metric("Holding (Bar 2+)", n_holding)
+            c_res5.metric("Exits Triggered Today", n_exits)
             
             st.dataframe(res_df, use_container_width=True, height=600)
         else:
