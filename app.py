@@ -63,17 +63,29 @@ def calculate_atr_pct(df: pd.DataFrame, period: int = 14) -> pd.Series:
         high - low,
         (high - prev_close).abs(),
         (low - prev_close).abs()
-    ], axis=1).max(axis=1)
+    ], axis=1).max(axis=1, skipna=True)
     
     atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     atr_pct = (atr / close.replace(0, np.nan)) * 100.0
-    return atr_pct.fillna(0.0)
+    return atr_pct.ffill().fillna(0.0)
 
 def prepare_crsi_data(df: pd.DataFrame, x_days: int) -> pd.DataFrame:
-    """Calculates RSI(3), ConnorsRSI(3,2,100), 2-Day CRSI, ATR(14)%, and X-Day Highs."""
+    """Cleans OHLC data and calculates RSI(3), ConnorsRSI(3,2,100), 2-Day CRSI, ATR(14)%, and X-Day Highs."""
     df = df.copy()
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
+        
+    # Strictly coerce OHLC columns to numeric and drop incomplete/NaN trailing rows from yfinance
+    ohlc_cols = ['Open', 'High', 'Low', 'Close']
+    for col in ohlc_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+    df = df.dropna(subset=ohlc_cols)
+    df = df[(df['Close'] > 0) & (df['Open'] > 0) & (df['High'] > 0) & (df['Low'] > 0)]
+    
+    if df.empty:
+        return df
         
     df['RSI3'] = calculate_rsi(df['Close'], 3)
     rsi_streak = calculate_rsi(calculate_streak(df['Close']), 2)
@@ -100,6 +112,8 @@ def load_vix_data(start_date: datetime) -> pd.DataFrame:
             vix.columns = vix.columns.get_level_values(0)
         if vix.index.tz is not None:
             vix.index = vix.index.tz_localize(None)
+        vix['Close'] = pd.to_numeric(vix['Close'], errors='coerce')
+        vix = vix.dropna(subset=['Close'])
         return vix
     except Exception:
         return pd.DataFrame()
@@ -567,9 +581,6 @@ def run_universe_backtest(
                         
                 total_equity = max(capital + current_unrealized, 0.0)
                 
-                # POSITION SIZING LOGIC:
-                # 1) Reinvest Profits: scales dynamically with total_equity / max_positions
-                # 2) Fixed Size (Shrinks on Losers, Caps on Winners): min(base_position_size, total_equity / max_positions)
                 if reinvest_profits:
                     target_slot_size = total_equity / max_positions
                 else:
@@ -744,7 +755,7 @@ max_positions = st.sidebar.slider(
 )
 
 implied_initial_cap = base_pos_size * max_positions
-st.sidebar.caption(f"Starting Universe Capital: **${implied_initial_cap:,.2f}** ({max_positions} slots × ${base_pos_size:,.2f})")
+st.sidebar.caption(f"Starting Universe Capital: **\\${implied_initial_cap:,.2f}** ({max_positions} slots × \\${base_pos_size:,.2f})")
 
 # ---------------- RANKING / TIE-BREAKER SELECTOR ----------------
 st.sidebar.markdown("---")
@@ -852,7 +863,7 @@ tab_chart, tab_universe, tab_single, tab_screener = st.tabs([
 with tab_chart:
     st.subheader("Candlestick Chart with System Entry & Exit Ticks")
     st.caption(
-        f"Position Sizing: **{sizing_mode_label}** (Base: **${base_pos_size:,.2f}**) | "
+        f"Position Sizing: **{sizing_mode_label}** (Base: **\\${base_pos_size:,.2f}**) | "
         "Green triangles = profitable trades; Red triangles = unprofitable trades."
     )
     
@@ -875,11 +886,11 @@ with tab_chart:
         if isinstance(raw_chart.columns, pd.MultiIndex):
             raw_chart.columns = raw_chart.columns.get_level_values(0)
             
-        if len(raw_chart) < 120:
+        calc_chart = prepare_crsi_data(raw_chart, x_days=x_days)
+        
+        if len(calc_chart) < 120:
             st.error("Insufficient market data for this ticker/period combination.")
         else:
-            calc_chart = prepare_crsi_data(raw_chart, x_days=x_days)
-            
             vix_blocked = set()
             if use_vix_filter:
                 vix_df = load_vix_data(start_fetch)
@@ -935,7 +946,7 @@ with tab_chart:
 with tab_universe:
     st.subheader("20-Year Multi-Asset Portfolio Backtest")
     st.caption(
-        f"Sizing: **{sizing_mode_label}** (${base_pos_size:,.2f}/trade × {max_positions} slots = **${implied_initial_cap:,.2f}** start) "
+        f"Sizing: **{sizing_mode_label}** (\\${base_pos_size:,.2f}/trade × {max_positions} slots = **\\${implied_initial_cap:,.2f}** start) "
         f"| Ranking: **{rank_method}** "
         f"| Time Stop: **{f'{effective_max_bars} Bars' if use_time_stop else 'Disabled'}**"
     )
@@ -1013,14 +1024,15 @@ with tab_universe:
                     try:
                         if isinstance(b_data.columns, pd.MultiIndex):
                             if t in b_data.columns.get_level_values(0):
-                                df_t = b_data[t].dropna(how='all')
+                                df_t = b_data[t].copy()
                             else:
                                 continue
                         else:
-                            df_t = b_data.dropna(how='all')
+                            df_t = b_data.copy()
                             
-                        if len(df_t) >= 120:
-                            data_dict[t] = prepare_crsi_data(df_t, x_days=x_days)
+                        df_clean = prepare_crsi_data(df_t, x_days=x_days)
+                        if len(df_clean) >= 120:
+                            data_dict[t] = df_clean
                     except Exception:
                         continue
             except Exception:
@@ -1144,7 +1156,7 @@ with tab_universe:
 # ------------------------------------------
 with tab_single:
     st.subheader("Single Ticker: Combined Selected Buckets & Visuals")
-    st.caption(f"Single-Ticker Starting Capital / Base Position Size: **${base_pos_size:,.2f}** | Mode: **{sizing_mode_label}**")
+    st.caption(f"Single-Ticker Starting Capital / Base Position Size: **\\${base_pos_size:,.2f}** | Mode: **{sizing_mode_label}**")
     
     s_col1, s_col2 = st.columns(2)
     with s_col1:
@@ -1159,9 +1171,8 @@ with tab_single:
             if isinstance(raw_s.columns, pd.MultiIndex):
                 raw_s.columns = raw_s.columns.get_level_values(0)
                 
-            if len(raw_s) >= 120:
-                df_prep = prepare_crsi_data(raw_s, x_days=x_days)
-                
+            df_prep = prepare_crsi_data(raw_s, x_days=x_days)
+            if len(df_prep) >= 120:
                 vix_blocked = set()
                 if use_vix_filter:
                     vix_df = load_vix_data(start_single_dt)
@@ -1299,16 +1310,15 @@ with tab_screener:
                     try:
                         if isinstance(b_raw.columns, pd.MultiIndex):
                             if t in b_raw.columns.get_level_values(0):
-                                df_t = b_raw[t].dropna(how='all')
+                                df_t = b_raw[t].copy()
                             else:
                                 continue
                         else:
-                            df_t = b_raw.dropna(how='all')
-                            
-                        if len(df_t) < 120:
-                            continue
+                            df_t = b_raw.copy()
                             
                         df_calc = prepare_crsi_data(df_t, x_days=x_days)
+                        if len(df_calc) < 120:
+                            continue
                         
                         sub_df = df_calc.iloc[-40:].copy()
                         in_trade = False
@@ -1351,10 +1361,12 @@ with tab_screener:
                                     bars_held_sim = 0
                                     
                         latest = df_calc.iloc[-1]
-                        crsi_2d = latest['CRSI_2D']
-                        atr_pct_14 = latest['ATR_Pct_14']
-                        crsi_today = latest['CRSI']
-                        rsi3_today = latest['RSI3']
+                        crsi_2d = float(latest['CRSI_2D'])
+                        atr_pct_14 = float(latest['ATR_Pct_14'])
+                        crsi_today = float(latest['CRSI'])
+                        rsi3_today = float(latest['RSI3'])
+                        close_today = float(latest['Close'])
+                        x_high_today = float(latest['X_Day_High']) if pd.notna(latest['X_Day_High']) else np.nan
                         is_falling = bool(latest[falling_col])
                         
                         in_selected_bucket = check_value_in_buckets(crsi_2d, selected_buckets)
@@ -1370,7 +1382,7 @@ with tab_screener:
                         if in_trade:
                             bars_held_sim += 1
                             hit_c = crsi_2d > crsi_exit_thresh
-                            hit_xh = pd.notna(latest['X_Day_High']) and (latest['High'] >= latest['X_Day_High'])
+                            hit_xh = pd.notna(x_high_today) and (latest['High'] >= x_high_today)
                             hit_time = (effective_max_bars > 0) and (bars_held_sim >= effective_max_bars)
                             
                             if hit_c or hit_xh or hit_time:
@@ -1391,8 +1403,8 @@ with tab_screener:
                             "Current Bucket": current_b_name,
                             "CRSI Today": round(crsi_today, 2),
                             "RSI(3) Today": round(rsi3_today, 2),
-                            "Close": round(latest['Close'], 2),
-                            "X-Day High": round(latest['X_Day_High'], 2) if pd.notna(latest['X_Day_High']) else np.nan
+                            "Close": round(close_today, 2),
+                            "X-Day High": round(x_high_today, 2) if pd.notna(x_high_today) else np.nan
                         })
                     except Exception:
                         continue
