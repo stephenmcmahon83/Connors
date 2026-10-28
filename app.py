@@ -186,6 +186,7 @@ def create_candlestick_crsi_chart(df: pd.DataFrame, ticker: str, x_days: int, tr
             pnl = trade.get('Net PnL ($)', trade.get('PnL ($)', 0.0))
             ret = trade.get('Net Return %', trade.get('Return %', 0.0))
             reason = trade.get('Exit Reason', 'Exit Trigger')
+            pos_size = trade.get('Position Size ($)', 0.0)
             is_win = pnl > 0
             
             if e_date in df_index_set:
@@ -193,6 +194,7 @@ def create_candlestick_crsi_chart(df: pd.DataFrame, ticker: str, x_days: int, tr
                     f"<b>🟢 BUY ENTRY</b><br>"
                     f"Date: {pd.to_datetime(e_date).strftime('%Y-%m-%d')}<br>"
                     f"Price: ${e_price:.2f}<br>"
+                    f"Pos Size: ${pos_size:,.2f}<br>"
                     f"Result: {'WIN (+)' if is_win else 'LOSS (-)'} ({ret:+.2f}%)"
                 )
                 if is_win:
@@ -389,7 +391,7 @@ def get_nasdaq100_tickers() -> list:
         return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "COST", "AVGO", "TSLA", "AMD"]
 
 # ==========================================
-# 6. UNIVERSE ENGINE WITH RANKING SELECTOR
+# 6. UNIVERSE ENGINE WITH POSITION SIZING MODES
 # ==========================================
 
 def run_universe_backtest(
@@ -401,17 +403,19 @@ def run_universe_backtest(
     require_falling: bool,
     falling_type: str,
     entry_timing: str,
-    initial_capital: float,
+    base_position_size: float,
     max_positions: int,
     commission_per_trade: float,
     vix_blocked_dates: set = None,
     max_bars_stop: int = 0,
-    rank_method: str = "Lowest 2-Day ConnorsRSI"
+    rank_method: str = "Lowest 2-Day ConnorsRSI",
+    reinvest_profits: bool = False
 ):
     all_dates = sorted(list(set().union(*[df.index.tolist() for df in data_dict.values()])))
     if len(all_dates) < 120:
         return pd.DataFrame(), pd.DataFrame()
 
+    initial_capital = base_position_size * max_positions
     capital = initial_capital
     active_positions = {}
     trades = []
@@ -499,6 +503,7 @@ def run_universe_backtest(
                     'Exit Price': round(exit_price, 2),
                     'Exit Reason': exit_reason,
                     'Shares': pos['shares'],
+                    'Position Size ($)': round(pos['gross_cost'], 2),
                     'Hold Days': (curr_date - pos['entry_date']).days,
                     'Hold Bars': pos['bars_held'],
                     'Setup 2D-CRSI': round(pos.get('setup_crsi', 0.0), 2),
@@ -512,7 +517,7 @@ def run_universe_backtest(
         for t in tickers_to_exit:
             del active_positions[t]
             
-        # 2. PROCESS ENTRIES (ORIGINAL OVERLAP LOGIC RESTORED)
+        # 2. PROCESS ENTRIES
         available_slots = max_positions - len(active_positions)
         setup_eval_date = prev_date if entry_timing == "Next Open" else curr_date
         vix_is_blocking = setup_eval_date in vix_blocked
@@ -547,7 +552,6 @@ def run_universe_backtest(
                     })
                     
             if candidates:
-                # Apply user-selected sorting method
                 if rank_method == "Highest 14-Day ATR (%)":
                     candidates = sorted(candidates, key=lambda c: c['ATR_Pct_14'], reverse=True)[:available_slots]
                 else:
@@ -562,7 +566,14 @@ def run_universe_backtest(
                         current_unrealized += pos['gross_cost']
                         
                 total_equity = max(capital + current_unrealized, 0.0)
-                target_slot_size = total_equity / max_positions
+                
+                # POSITION SIZING LOGIC:
+                # 1) Reinvest Profits: scales dynamically with total_equity / max_positions
+                # 2) Fixed Size (Shrinks on Losers, Caps on Winners): min(base_position_size, total_equity / max_positions)
+                if reinvest_profits:
+                    target_slot_size = total_equity / max_positions
+                else:
+                    target_slot_size = min(base_position_size, total_equity / max_positions)
                 
                 for cand in candidates:
                     t = cand['Ticker']
@@ -696,7 +707,46 @@ selected_buckets = st.sidebar.multiselect(
 if not selected_buckets:
     st.sidebar.warning("Select at least one bucket to generate entry signals.")
 
-# RANKING / TIE-BREAKER SELECTOR
+# ---------------- POSITION SIZING & CAPITAL ----------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("💰 Position Sizing & Capital")
+
+sizing_mode_label = st.sidebar.radio(
+    "Position Sizing Mode:",
+    options=[
+        "Fixed Size (Caps at Base Size, Shrinks on Losers)",
+        "Reinvest Profits (Compound Position Size)"
+    ],
+    index=0,
+    help=(
+        "Fixed Size: Caps each trade at your Base Position Size ($2,000) when winning, "
+        "but shrinks proportionally if losing trades drop your account below initial capital.\n\n"
+        "Reinvest Profits: Dynamically scales position size up (or down) with total portfolio equity."
+    )
+)
+reinvest_profits_flag = (sizing_mode_label == "Reinvest Profits (Compound Position Size)")
+
+base_pos_size = st.sidebar.number_input(
+    "Base Position Size per Trade ($)",
+    min_value=200.0,
+    max_value=500000.0,
+    value=2000.0,
+    step=500.0,
+    help="Target dollar allocation per position slot (e.g., $2,000)."
+)
+
+max_positions = st.sidebar.slider(
+    "Max Concurrent Open Positions (Universe)",
+    min_value=1,
+    max_value=30,
+    value=5,
+    step=1
+)
+
+implied_initial_cap = base_pos_size * max_positions
+st.sidebar.caption(f"Starting Universe Capital: **${implied_initial_cap:,.2f}** ({max_positions} slots × ${base_pos_size:,.2f})")
+
+# ---------------- RANKING / TIE-BREAKER SELECTOR ----------------
 st.sidebar.markdown("---")
 st.sidebar.subheader("🏆 Candidate Ranking / Tie-Breaker")
 rank_method = st.sidebar.radio(
@@ -802,8 +852,8 @@ tab_chart, tab_universe, tab_single, tab_screener = st.tabs([
 with tab_chart:
     st.subheader("Candlestick Chart with System Entry & Exit Ticks")
     st.caption(
-        "Green triangles indicate profitable trades; Red triangles indicate unprofitable trades. "
-        "Dotted lines connect entries to exits."
+        f"Position Sizing: **{sizing_mode_label}** (Base: **${base_pos_size:,.2f}**) | "
+        "Green triangles = profitable trades; Red triangles = unprofitable trades."
     )
     
     c_col1, c_col2 = st.columns([1, 2])
@@ -845,12 +895,13 @@ with tab_chart:
                 require_falling=require_falling_rsi,
                 falling_type=falling_type,
                 entry_timing=entry_timing,
-                initial_capital=10000.0,
+                base_position_size=base_pos_size,
                 max_positions=1,
                 commission_per_trade=comm_per_order,
                 vix_blocked_dates=vix_blocked,
                 max_bars_stop=effective_max_bars,
-                rank_method=rank_method
+                rank_method=rank_method,
+                reinvest_profits=reinvest_profits_flag
             )
             
             cutoff = datetime.today() - timedelta(days=lookback_days)
@@ -884,13 +935,12 @@ with tab_chart:
 with tab_universe:
     st.subheader("20-Year Multi-Asset Portfolio Backtest")
     st.caption(
-        f"Buckets: **{', '.join(selected_buckets) if selected_buckets else 'None'}** "
+        f"Sizing: **{sizing_mode_label}** (${base_pos_size:,.2f}/trade × {max_positions} slots = **${implied_initial_cap:,.2f}** start) "
         f"| Ranking: **{rank_method}** "
-        f"| Time Stop: **{f'{effective_max_bars} Bars' if use_time_stop else 'Disabled'}** "
-        f"| VIX Filter: **{'Active (' + vix_mode + ')' if use_vix_filter else 'Disabled'}**"
+        f"| Time Stop: **{f'{effective_max_bars} Bars' if use_time_stop else 'Disabled'}**"
     )
     
-    u1, u2, u3 = st.columns([2, 1, 1])
+    u1, u2 = st.columns([2, 1])
     with u1:
         univ_choice = st.selectbox(
             "Select Universe Basket:",
@@ -906,14 +956,8 @@ with tab_universe:
         )
     with u2:
         start_year = st.selectbox("Start Year", options=list(range(2004, 2026)), index=2)
-    with u3:
-        initial_cap = st.number_input("Starting Capital ($)", value=10000.0, step=2500.0)
 
-    p1, p2 = st.columns(2)
-    with p1:
-        max_positions = st.slider("Max Concurrent Open Positions", min_value=1, max_value=30, value=5, step=1)
-    with p2:
-        custom_univ = st.text_input("Custom Ticker Basket (if selected):", value="SPY, QQQ, DIA, IWM, SMH, XLF, XLE, GLD, TLT")
+    custom_univ = st.text_input("Custom Ticker Basket (if selected):", value="SPY, QQQ, DIA, IWM, SMH, XLF, XLE, GLD, TLT")
 
     if st.button("🚀 Run Universe Backtest", type="primary"):
         if not selected_buckets:
@@ -989,7 +1033,7 @@ with tab_universe:
         if not data_dict:
             st.error("No valid historical price data retrieved.")
         else:
-            with st.spinner(f"Simulating portfolio (Sorting candidates by {rank_method})..."):
+            with st.spinner(f"Simulating portfolio ({sizing_mode_label} | Sorted by {rank_method})..."):
                 trades_df, equity_df = run_universe_backtest(
                     data_dict=data_dict,
                     selected_buckets=selected_buckets,
@@ -999,12 +1043,13 @@ with tab_universe:
                     require_falling=require_falling_rsi,
                     falling_type=falling_type,
                     entry_timing=entry_timing,
-                    initial_capital=initial_cap,
+                    base_position_size=base_pos_size,
                     max_positions=max_positions,
                     commission_per_trade=comm_per_order,
                     vix_blocked_dates=vix_blocked,
                     max_bars_stop=effective_max_bars,
-                    rank_method=rank_method
+                    rank_method=rank_method,
+                    reinvest_profits=reinvest_profits_flag
                 )
                 
             if trades_df.empty:
@@ -1016,9 +1061,9 @@ with tab_universe:
                 win_rate = (len(wins) / n_trades) * 100.0
                 
                 final_eq = equity_df['Equity'].iloc[-1]
-                tot_ret = ((final_eq / initial_cap) - 1) * 100.0
+                tot_ret = ((final_eq / implied_initial_cap) - 1) * 100.0
                 years = max((equity_df.index[-1] - equity_df.index[0]).days / 365.25, 1.0)
-                cagr = (((final_eq / initial_cap) ** (1 / years)) - 1) * 100.0 if final_eq > 0 else -100.0
+                cagr = (((final_eq / implied_initial_cap) ** (1 / years)) - 1) * 100.0 if final_eq > 0 else -100.0
                 
                 gp = wins['Net PnL ($)'].sum()
                 gl = abs(losses['Net PnL ($)'].sum())
@@ -1037,7 +1082,7 @@ with tab_universe:
                 m4.metric("CAGR", f"{cagr:.1f}%")
                 m5.metric("Profit Factor", f"{pf:.2f}" if not np.isnan(pf) else "N/A")
                 m6.metric("Max Drawdown", f"{max_dd:.1f}%")
-                m7.metric("Time Stops", time_stopped_trades)
+                m7.metric("Ending Equity", f"${final_eq:,.0f}")
                 
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
@@ -1048,7 +1093,7 @@ with tab_universe:
                     name='Net Portfolio Equity'
                 ))
                 fig.update_layout(
-                    title=f"Net Portfolio Equity Curve ({start_year} – Present | Sorted by: {rank_method})",
+                    title=f"Net Portfolio Equity Curve ({start_year} – Present | {sizing_mode_label})",
                     xaxis_title="Date",
                     yaxis_title="Total Equity ($)",
                     template="plotly_white",
@@ -1059,7 +1104,7 @@ with tab_universe:
                 st.markdown("---")
                 st.subheader("📅 Annual Performance Breakdown")
                 
-                annual_df = calculate_annual_metrics(equity_df, trades_df, initial_cap)
+                annual_df = calculate_annual_metrics(equity_df, trades_df, implied_initial_cap)
                 
                 bar_colors = ['#00C805' if r >= 0 else '#FF3B30' for r in annual_df['Return %']]
                 fig_ann = go.Figure()
@@ -1099,6 +1144,7 @@ with tab_universe:
 # ------------------------------------------
 with tab_single:
     st.subheader("Single Ticker: Combined Selected Buckets & Visuals")
+    st.caption(f"Single-Ticker Starting Capital / Base Position Size: **${base_pos_size:,.2f}** | Mode: **{sizing_mode_label}**")
     
     s_col1, s_col2 = st.columns(2)
     with s_col1:
@@ -1131,12 +1177,13 @@ with tab_single:
                     require_falling=require_falling_rsi,
                     falling_type=falling_type,
                     entry_timing=entry_timing,
-                    initial_capital=10000.0,
+                    base_position_size=base_pos_size,
                     max_positions=1,
                     commission_per_trade=comm_per_order,
                     vix_blocked_dates=vix_blocked,
                     max_bars_stop=effective_max_bars,
-                    rank_method=rank_method
+                    rank_method=rank_method,
+                    reinvest_profits=reinvest_profits_flag
                 )
                 
                 st.markdown("#### 🔍 Price Action & System Trades (Last 1 Year)")
@@ -1149,7 +1196,7 @@ with tab_single:
                 else:
                     n_s = len(t_single)
                     wr_s = (len(t_single[t_single['Net PnL ($)'] > 0]) / n_s) * 100
-                    tot_ret_s = ((eq_single['Equity'].iloc[-1] / 10000.0) - 1) * 100
+                    tot_ret_s = ((eq_single['Equity'].iloc[-1] / base_pos_size) - 1) * 100
                     
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Total Trades", n_s)
